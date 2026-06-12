@@ -45,8 +45,8 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant").strip()
 
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "300"))
-MAX_ITEMS_PER_SEARCH = int(os.getenv("MAX_ITEMS_PER_SEARCH", "20"))
-MIN_AI_SCORE_TO_SEND = int(os.getenv("MIN_AI_SCORE_TO_SEND", "4"))
+MAX_ITEMS_PER_SEARCH = int(os.getenv("MAX_ITEMS_PER_SEARCH", "50"))
+MIN_AI_SCORE_TO_SEND = int(os.getenv("MIN_AI_SCORE_TO_SEND", "3"))
 MIN_DEAL_SCORE_TO_SEND = int(os.getenv("MIN_DEAL_SCORE_TO_SEND", "0"))
 FEEDBACK_LEARNING_ENABLED = os.getenv("FEEDBACK_LEARNING_ENABLED", "true").lower() in ["1", "true", "yes", "y"]
 FEEDBACK_TYPES = {
@@ -64,16 +64,34 @@ FILTER_GENERATION_MODEL = os.getenv("FILTER_GENERATION_MODEL", GROQ_MODEL).strip
 
 
 # New freshness filter.
-ONLY_RECENT_MINUTES = int(os.getenv("ONLY_RECENT_MINUTES", "5"))
+ONLY_RECENT_MINUTES = int(os.getenv("ONLY_RECENT_MINUTES", "60"))
 
 # If Apify does not return age/date:
 # true  = skip item, safer, avoids old listings
 # false = allow item, may send old listings
 SKIP_UNKNOWN_AGE = os.getenv("SKIP_UNKNOWN_AGE", "false").lower() in ["1", "true", "yes", "y"]
 
-# Quality filter for electronics.
-# This rejects risky Vinted listings before Groq AI evaluation, so it costs less.
-REJECT_BAD_CONDITIONS = os.getenv("REJECT_BAD_CONDITIONS", "true").lower() in ["1", "true", "yes", "y"]
+# Optional hard quality filter.
+# Default is false in v3 because the bot should work for electronics, shoes, clothes, collectibles, toys, etc.
+# AI evaluation handles quality risks after category-aware filtering.
+REJECT_BAD_CONDITIONS = os.getenv("REJECT_BAD_CONDITIONS", "false").lower() in ["1", "true", "yes", "y"]
+
+# v4 catch-more mode:
+# Words like "ryski" / "ślady użytkowania" should not silently block an offer.
+# They are moved to quality_risk_any and evaluated by AI, so good cheap offers can still be sent with a warning.
+SOFTEN_MINOR_WEAR_WORDS = os.getenv("SOFTEN_MINOR_WEAR_WORDS", "true").lower() in ["1", "true", "yes", "y"]
+MINOR_WEAR_WORDS = [
+    x.strip().lower()
+    for x in os.getenv(
+        "MINOR_WEAR_WORDS",
+        "ryska,ryski,rysy,porysowany,porysowana,porysowane,"
+        "ślady użytkowania,slady uzytkowania,ślady uzytkowania,slady użytkowania,"
+        "normalne ślady,normalne slady,drobne ślady,drobne slady,"
+        "minimalne ślady,minimalne slady,małe ryski,male ryski,"
+        "bez pudełka,bez pudelka,brak pudełka,brak pudelka"
+    ).split(",")
+    if x.strip()
+]
 
 BAD_CONDITIONS = [
     x.strip().lower()
@@ -752,69 +770,279 @@ def text_contains_all_groups(text: str, groups: Any) -> Tuple[bool, str]:
     return True, "required groups ok"
 
 
+
+def infer_query_category(keyword: str) -> str:
+    """Small local classifier used only as a safety net around the AI-generated filter."""
+    k = (keyword or "").lower()
+
+    electronics = ["ipad", "iphone", "apple watch", "watch se", "macbook", "airpods", "redmi pad", "tablet", "telefon", "smartfon", "laptop", "kamera", "aparat", "konsola", "ps5", "xbox", "switch"]
+    footwear = ["buty", "sneakers", "sneaker", "nike", "adidas", "dunk", "jordan", "yeezy", "air force", "new balance", "asics", "puma", "reebok", "vans", "converse", "trampki"]
+    clothing = ["kurtka", "bluza", "hoodie", "spodnie", "koszulka", "t-shirt", "tshirt", "sweter", "sukienka", "płaszcz", "plaszcz", "czapka", "czapeczka"]
+    collectibles = ["funko", "pop", "figurka", "figurki", "lego", "pokemon", "karta", "karty", "hot wheels", "manga", "komiks", "resorak", "model", "zabawka"]
+    watches = ["zegarek", "watch", "g-shock", "casio", "seiko", "garmin", "smartwatch"]
+    beauty = ["perfumy", "kosmetyk", "kosmetyki", "krem", "serum", "makeup", "makijaż", "makijaz"]
+    bags = ["plecak", "torba", "torebka", "portfel", "walizka"]
+
+    def any_in(words):
+        return any(w in k for w in words)
+
+    if any_in(electronics):
+        return "electronics"
+    if any_in(footwear):
+        return "footwear"
+    if any_in(collectibles):
+        return "collectibles"
+    if any_in(watches):
+        return "watches"
+    if any_in(beauty):
+        return "beauty"
+    if any_in(bags):
+        return "bags"
+    if any_in(clothing):
+        return "clothing"
+    return "generic"
+
+
 def build_ai_filter_prompt(keyword: str, max_price: Optional[float]) -> str:
+    category_hint = infer_query_category(keyword)
     return f"""
 Ти створюєш JSON-фільтр для Telegram-бота, який шукає товари на Vinted у Польщі.
 Користувач НЕ буде сам писати фільтри. Він дає тільки людський запит.
-Твоя задача — самостійно згенерувати правила пошуку і відсіювання сміття.
+Твоя задача — спочатку зрозуміти категорію товару, а потім згенерувати правила саме під цю категорію.
 
 Запит користувача: {keyword}
 Максимальна ціна, якщо є: {max_price} PLN
+Підказка категорії від локального класифікатора: {category_hint}
 
 Поверни ТІЛЬКИ валідний JSON без markdown. Формат:
 {{
+  "product_category": "electronics / footwear / clothing / collectibles / watches / beauty / bags / toys / books / home / generic",
   "vinted_query": "короткий пошуковий запит для Vinted польською/англійською, без ціни",
-  "filter_summary_ua": "коротко українською що саме шукаємо і що відсікаємо; не пиши про гарантію, якщо користувач прямо її не просив",
+  "filter_summary_ua": "коротко українською що саме шукаємо і що відсікаємо; без вигаданих гарантій/чеків",
   "required_groups": [
-    ["синоніми головного товару"],
-    ["синоніми конкретної моделі/покоління/версії"]
+    ["синоніми бренду або головного товару"],
+    ["синоніми моделі/серії/версії, якщо користувач її вказав"]
   ],
-  "include_any": ["додаткові корисні слова, які можуть підтвердити що це правильний товар"],
-  "reject_any": ["слова, які треба відсікти: аксесуари, інші моделі, поломки, блокування"],
-  "wrong_product_any": ["слова інших товарів, які схожі але не підходять"],
-  "quality_risk_any": ["uszkodzony", "pęknięty", "zbity", "icloud", "blokada", "nie działa"],
-  "min_ai_score": 4,
+  "include_any": ["додаткові корисні слова, які можуть підтвердити правильний товар"],
+  "reject_any": ["слова, які майже точно означають аксесуар/інший товар/непотрібний стан саме для цієї категорії"],
+  "wrong_product_any": ["інші схожі товари або моделі, які не підходять"],
+  "quality_risk_any": ["ризикові слова саме для цієї категорії, які AI має оцінити, але не завжди блокувати"],
+  "min_ai_score": 3,
   "message_to_seller_pl": "коротке питання продавцю польською, що перевірити перед покупкою"
 }}
 
-Правила:
-- Для iPad 10 генерації додай варіанти: ipad 10, 10 gen, 10 generacji, 10th, 2022, 10.9, 10,9, A2696, A2757, A2777.
-- Для техніки завжди відсікай аксесуари: etui, case, szkło, folia, kabel, ładowarka, pudełko, rysik, klawiatura, pokrowiec, uchwyt.
-- Для Apple відсікай iCloud/Apple ID lock і зламані/на частини.
-- НЕ вимагай гарантію, чек або faktura, якщо користувач прямо цього не написав.
-- Для Apple Watch SE 2 vinted_query має бути широким: "apple watch se", а не занадто вузьким "apple watch se 2".
-- Для iPad 10 vinted_query має бути широким: "ipad 10" або "ipad", а точну модель перевіряй у required_groups.
-- Якщо запит про конкретну модель, відсікай старі/інші моделі.
-- Не роби занадто вузький фільтр: продавці можуть писати назву неточно.
-- required_groups мають бути достатньо широкі, щоб не пропускати сміття, але не блокувати нормальні оголошення.
+ГОЛОВНЕ ПРАВИЛО:
+- НІКОЛИ не використовуй правила від іншої категорії.
+- Якщо користувач шукає кросівки Nike Dunk Low — НЕ додавай ipad, tablet, iCloud, Apple ID, 10 gen, A2696, A2757, 10.9.
+- Якщо користувач шукає Funko Pop або фігурку — НЕ додавай технічні фільтри типу iCloud/ładowarka/Apple ID.
+- Якщо користувач шукає одяг/взуття — НЕ відсікай charger, iCloud, kabel, якщо це не має сенсу для категорії.
+
+Як будувати фільтр:
+1. Визнач категорію товару.
+2. Вибери широке vinted_query, яке реально дасть результати на Vinted.
+3. required_groups мають бути логічними AND-групами: мінімум одна фраза з кожної групи повинна бути в оголошенні.
+4. Не роби один величезний required_groups зі словами різних категорій.
+5. Не вимагай розмір взуття/одягу, якщо користувач не вказав розмір.
+6. Не вимагай чек/оригінальну коробку/гарантію, якщо користувач прямо цього не просив.
+7. Краще пропустити сумнівну оферту на AI-оцінку, ніж мовчки її заблокувати.
+
+Приклади категорій:
+
+A) Запит: nike dunk low до 150
+Очікувано:
+- product_category: footwear
+- vinted_query: "nike dunk low"
+- required_groups: [["nike"], ["dunk"], ["low"]]
+- reject_any: ["etui", "case", "brelok", "miniaturka", "zdjęcie", "plakat"]
+- wrong_product_any: ["dunk high", "air force", "jordan", "yeezy", "adidas"]
+- quality_risk_any: ["podróbka", "fake", "replika", "zniszczone", "dziura", "odklejona podeszwa"]
+
+B) Запит: funko pop harry potter до 60
+Очікувано:
+- product_category: collectibles
+- vinted_query: "funko pop harry potter"
+- required_groups: [["funko", "pop"], ["harry potter", "potter"]]
+- reject_any: ["koszulka", "bluza", "plakat", "naklejka", "brelok"]
+- wrong_product_any: ["lego", "książka", "ksiazka", "dvd", "gra"]
+- quality_risk_any: ["uszkodzone pudełko", "brak pudełka", "podróbka", "fake"]
+
+C) Запит: lego star wars do 100
+- product_category: collectibles
+- vinted_query: "lego star wars"
+- required_groups: [["lego"], ["star wars"]]
+- reject_any: ["instrukcja", "pudełko samo", "samo pudełko", "naklejki"]
+- quality_risk_any: ["niekompletne", "braki", "bez figurek", "części"]
+
+D) Запит: kurtka nike tech fleece do 200
+- product_category: clothing
+- vinted_query: "nike tech fleece"
+- required_groups: [["nike"], ["tech fleece"]]
+- wrong_product_any: ["spodnie", "shorts"] якщо користувач чітко написав kurtka/bluza
+- quality_risk_any: ["plamy", "dziura", "zmechacona", "podróbka", "fake"]
+
+E) Запит: ipad 10 gen do 1000
+- product_category: electronics
+- vinted_query: "ipad 10"
+- required_groups: [["ipad", "i pad"], ["10 gen", "10 generacji", "10th", "2022", "10.9", "10,9", "A2696", "A2757", "A2777"]]
+- reject_any: ["etui", "case", "szkło", "folia", "kabel", "ładowarka", "pudełko", "rysik", "klawiatura"]
+- quality_risk_any: ["icloud", "apple id", "blokada", "uszkodzony", "pęknięty", "zbity", "nie działa"]
+
+F) Запит: apple watch se 2 do 400
+- product_category: electronics
+- vinted_query: "apple watch se"
+- required_groups: [["apple watch", "watch"], ["se"], ["2 gen", "2 generacji", "2. generacji", "drugiej generacji", "2022", "2023", "se 2", "se2"]]
+- reject_any: ["pasek", "strap", "bransoleta", "etui", "szkło", "ładowarka", "kabel", "pudełko"]
+- quality_risk_any: ["icloud", "apple id", "blokada", "uszkodzony", "pęknięty", "zbity", "nie działa", "kondycja baterii"]
 """.strip()
 
 
-def fallback_filter(keyword: str, max_price: Optional[float]) -> Dict[str, Any]:
-    k = (keyword or "").lower()
+def local_category_filter(keyword: str, max_price: Optional[float]) -> Dict[str, Any]:
+    k = (keyword or "").lower().strip()
+    category = infer_query_category(k)
+
+    reject_common_market_noise = ["zdjęcie", "zdjecie", "plakat", "naklejka", "brelok", "miniaturka"]
+
+    if category == "footwear":
+        required = []
+        if "nike" in k: required.append(["nike"])
+        if "dunk" in k: required.append(["dunk"])
+        if "low" in k: required.append(["low"])
+        if "jordan" in k: required.append(["jordan"])
+        if "air force" in k or "af1" in k: required.append(["air force", "af1"])
+        if not required and keyword: required = [[keyword]]
+        return {
+            "product_category": "footwear",
+            "vinted_query": keyword,
+            "filter_summary_ua": "Шукаю конкретне взуття/кросівки, без аксесуарів, фейків і явно знищеного стану.",
+            "required_groups": required,
+            "include_any": ["buty", "sneakers", "rozmiar", "size"],
+            "reject_any": reject_common_market_noise + ["etui", "case", "pudełko samo", "samo pudełko"],
+            "wrong_product_any": [],
+            "quality_risk_any": ["podróbka", "podrobka", "fake", "replika", "zniszczone", "dziura", "odklejona podeszwa", "brudne"],
+            "min_ai_score": MIN_AI_SCORE_TO_SEND,
+            "message_to_seller_pl": "Cześć, czy buty są oryginalne i w jakim są dokładnie stanie? Czy możesz wysłać więcej zdjęć podeszwy, metki i wnętrza?"
+        }
+
+    if category == "collectibles":
+        required = []
+        if "funko" in k or "pop" in k: required.append(["funko", "pop"])
+        if "lego" in k: required.append(["lego"])
+        if "pokemon" in k: required.append(["pokemon", "pokémon"])
+        # Add a broad second group from remaining meaningful terms only if obvious.
+        for term in ["harry potter", "star wars", "marvel", "dc", "naruto", "dragon ball", "one piece", "disney"]:
+            if term in k: required.append([term])
+        if not required and keyword: required = [[keyword]]
+        return {
+            "product_category": "collectibles",
+            "vinted_query": keyword,
+            "filter_summary_ua": "Шукаю колекційний товар/фігурку, відсікаю одяг, плакати, наклейки та інші нецільові товари.",
+            "required_groups": required,
+            "include_any": ["figurka", "kolekcjonerskie", "collector", "oryginalne"],
+            "reject_any": reject_common_market_noise + ["koszulka", "bluza", "spodnie", "czapka", "książka", "ksiazka", "dvd", "gra"],
+            "wrong_product_any": [],
+            "quality_risk_any": ["podróbka", "podrobka", "fake", "uszkodzone pudełko", "brak pudełka", "brak pudelka", "niekompletne", "braki"],
+            "min_ai_score": MIN_AI_SCORE_TO_SEND,
+            "message_to_seller_pl": "Cześć, czy figurka jest oryginalna i w jakim stanie jest pudełko? Czy możesz wysłać dodatkowe zdjęcia z każdej strony?"
+        }
+
+    if category in ["clothing", "bags", "beauty", "watches"]:
+        return {
+            "product_category": category,
+            "vinted_query": keyword,
+            "filter_summary_ua": "Szuka товару з твого запиту, відсікає очевидно неправильні речі та ризиковий стан.",
+            "required_groups": [[keyword]] if keyword else [],
+            "include_any": [],
+            "reject_any": reject_common_market_noise,
+            "wrong_product_any": [],
+            "quality_risk_any": ["podróbka", "podrobka", "fake", "uszkodzony", "zniszczony", "plamy", "dziura"],
+            "min_ai_score": MIN_AI_SCORE_TO_SEND,
+            "message_to_seller_pl": "Cześć, czy oferta jest aktualna? Czy możesz napisać, jaki jest dokładny stan i wysłać dodatkowe zdjęcia?"
+        }
+
+    # Electronics and generic fallback
     required = [[keyword.lower()]] if keyword else []
     if "ipad" in k and ("10" in k or "десят" in k or "gener" in k):
         required = [["ipad", "i pad"], ["10", "10 gen", "10 generacji", "10th", "2022", "10.9", "10,9"]]
     elif "apple watch" in k and "se" in k:
         required = [["apple watch", "watch"], ["se"], ["2", "gen 2", "2 gen", "2 generacji", "2022", "2023"]]
     return {
+        "product_category": category,
         "vinted_query": "apple watch se" if ("apple watch" in k and "se" in k) else keyword,
-        "filter_summary_ua": "AI-фільтр fallback: шукаю основний запит, відсікаю аксесуари, поломки і блокування.",
+        "filter_summary_ua": "Шукаю товар з твого запиту, відсікаю явно неправильні товари та ризикові оголошення.",
         "required_groups": required,
         "include_any": [],
-        "reject_any": [
-            "etui", "case", "cover", "pokrowiec", "szkło", "szklo", "folia", "kabel",
-            "ładowarka", "ladowarka", "charger", "pudełko", "pudelko", "rysik", "stylus",
-            "klawiatura", "uchwyt", "stojak", "uszkodzony", "uszkodzona", "pęknięty",
-            "pekniety", "zbity", "nie działa", "nie dziala", "części", "czesci", "icloud",
-            "apple id", "blokada", "zablokowany", "locked", "broken", "damaged", "for parts"
-        ],
+        "reject_any": ["etui", "case", "cover", "pokrowiec", "szkło", "szklo", "folia", "kabel", "ładowarka", "ladowarka", "charger", "pudełko", "pudelko", "rysik", "stylus", "klawiatura", "uchwyt", "stojak"],
         "wrong_product_any": [],
         "quality_risk_any": ["uszkodzony", "pęknięty", "zbity", "icloud", "blokada", "nie działa"],
         "min_ai_score": MIN_AI_SCORE_TO_SEND,
-        "message_to_seller_pl": "Dzień dobry, czy oferta jest aktualna? Czy urządzenie jest w pełni sprawne, bez blokady konta i czy można prosić o zdjęcia ekranu oraz numer modelu?"
+        "message_to_seller_pl": "Dzień dobry, czy oferta jest aktualna? Czy przedmiot jest w pełni sprawny i czy można prosić o dodatkowe zdjęcia?"
     }
 
+
+def filter_has_category_leak(keyword: str, data: Dict[str, Any]) -> bool:
+    """Detect cases where the LLM accidentally uses iPad/electronics rules for shoes, Funko, clothes, etc."""
+    category = infer_query_category(keyword)
+    if category in ["electronics", "generic"]:
+        return False
+    serialized = json.dumps(data, ensure_ascii=False).lower()
+    tech_leaks = ["ipad", "iphone", "icloud", "apple id", "a2696", "a2757", "a2777", "10.9", "10,9", "ładowarka", "ladowarka", "charger", "kabel"]
+    # apple/nike may coexist in brand names, so only count strong tech leakage.
+    return any(x in serialized for x in tech_leaks)
+
+
+def move_minor_wear_from_reject_to_risk(data: Dict[str, Any]) -> Dict[str, Any]:
+    if not SOFTEN_MINOR_WEAR_WORDS:
+        return data
+
+    reject = as_list(data.get("reject_any"))
+    risks = as_list(data.get("quality_risk_any"))
+
+    kept_reject = []
+    moved = []
+    for word in reject:
+        w = str(word).strip()
+        wl = w.lower()
+        if any(minor and minor in wl for minor in MINOR_WEAR_WORDS):
+            moved.append(w)
+        else:
+            kept_reject.append(w)
+
+    if moved:
+        data["reject_any"] = kept_reject
+        # preserve order and avoid duplicates
+        seen = set(x.lower() for x in risks)
+        for w in moved:
+            if w.lower() not in seen:
+                risks.append(w)
+                seen.add(w.lower())
+        data["quality_risk_any"] = risks
+
+    return data
+
+
+def sanitize_ai_filter(keyword: str, data: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(data, dict):
+        return local_category_filter(keyword, None)
+    data.setdefault("product_category", infer_query_category(keyword))
+    data.setdefault("vinted_query", keyword)
+    data.setdefault("filter_summary_ua", "AI створив фільтр для цього пошуку.")
+    data.setdefault("required_groups", [[keyword.lower()]] if keyword else [])
+    data.setdefault("include_any", [])
+    data.setdefault("reject_any", [])
+    data.setdefault("wrong_product_any", [])
+    data.setdefault("quality_risk_any", [])
+    data.setdefault("min_ai_score", MIN_AI_SCORE_TO_SEND)
+    data.setdefault("message_to_seller_pl", "Cześć, czy oferta jest aktualna? Czy możesz wysłać więcej informacji i zdjęć?")
+
+    if filter_has_category_leak(keyword, data):
+        logger.warning("AI filter category leak detected for keyword=%s. Using local category fallback.", keyword)
+        return local_category_filter(keyword, None)
+
+    return data
+
+
+def fallback_filter(keyword: str, max_price: Optional[float]) -> Dict[str, Any]:
+    return local_category_filter(keyword, max_price)
 
 def generate_filter_with_ai(keyword: str, max_price: Optional[float]) -> Dict[str, Any]:
     if not DYNAMIC_AI_FILTERS_ENABLED:
@@ -824,7 +1052,7 @@ def generate_filter_with_ai(keyword: str, max_price: Optional[float]) -> Dict[st
         completion = groq_client.chat.completions.create(
             model=FILTER_GENERATION_MODEL,
             messages=[
-                {"role": "system", "content": "You generate strict but practical marketplace search filters. Return valid JSON only."},
+                {"role": "system", "content": "You generate category-aware marketplace search filters for Vinted. Never mix rules between categories. Return valid JSON only."},
                 {"role": "user", "content": build_ai_filter_prompt(keyword, max_price)},
             ],
             temperature=0.15,
@@ -1398,7 +1626,10 @@ def evaluate_item_with_ai(item: Dict[str, Any], search: Dict[str, Any]) -> Dict[
 ВАЖЛИВО:
 - Ти НЕ бачиш фото напряму.
 - Не відсікай автоматично хороший дешевий товар тільки через дрібні подряпини; познач це як ризик.
-- Для Apple Watch / iPad / техніки завжди перевіряй: правильна модель, iCloud/Apple ID logout, стан екрана, батарея якщо доступно.
+- Оцінюй товар відповідно до його категорії: техніка, взуття, одяг, колекційні фігурки/Funko/Lego, косметика, сумки тощо.
+- Для техніки перевіряй правильну модель, блокування акаунта, стан екрана, батарею якщо доступно.
+- Для взуття перевіряй оригінальність, модель, розмір якщо вказаний, стан підошви/верху.
+- Для Funko/фігурок/Lego перевіряй оригінальність, комплектність, стан коробки, чи це не плакат/наклейка/одяг.
 - Deal score — це не те саме, що безпека. Дешевий товар з дрібним ризиком може мати високий deal_score, але нижчий safety score.
 
 Задача користувача:
@@ -1423,10 +1654,11 @@ score 0-10 = наскільки товар підходить і безпечн�
 deal_score 0-10 = наскільки це вигідна ціна/угода для такого товару.
 
 Ризики:
-- uszkodzony / nie działa / części / iCloud / blokada = сильний ризик
-- pęknięty / zbity ekran = сильний ризик
-- ryski / drobne rysy = мʼякий ризик, не обовʼязково погана оферта
-- занадто короткий опис або мало фото = мʼякий/середній ризик
+- Для техніки: uszkodzony / nie działa / części / iCloud / blokada / pęknięty ekran = сильний ризик.
+- Для взуття: podróbka/fake/replika, dziura, odklejona podeszwa, дуже знищений стан = сильний ризик.
+- Для Funko/фігурок/Lego: fake, brak pudełka, uszkodzone pudełko, niekompletne, braki = ризик, але не завжди автоматичний бан.
+- ryski / drobne rysy = мʼякий ризик, не обовʼязково погана оферта.
+- занадто короткий опис або мало фото = мʼякий/середній ризик.
 
 Відповідай тільки JSON без markdown:
 {{
@@ -1566,7 +1798,7 @@ async def process_search(
                     chat_id=telegram_id,
                     text=(
                         f"Нічого свіжого не знайшов по пошуку: {keyword}\n"
-                        f"Фільтр: останні {ONLY_RECENT_MINUTES} хв, а якщо Vinted не віддав час — newest_first."
+                        f"Фільтр: останні {ONLY_RECENT_MINUTES} хв, max items: {MAX_ITEMS_PER_SEARCH}. Якщо Vinted не віддав час — newest_first."
                     ),
                 )
             return 0
@@ -1759,7 +1991,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 Я шукаю свіжі оферти напряму на Vinted без Apify, оцінюю їх через Groq AI, рахую Deal score і вчуся на твоєму фідбеку.
 
 <b>Зараз фільтр:</b>
-тільки оголошення приблизно за останні <b>{ONLY_RECENT_MINUTES} хв.</b>\nТакож відсікаю ризики: <b>Zadowalający, uszkodzony, pęknięty, iCloud/Apple ID lock</b>\nІ відкидаю аксесуари: <b>etui, folia, szkło, ładowarka, pasek</b>\nФільтр спрощений: перевіряю назву + опис + бренд, а фінальну оцінку дає AI.
+оголошення приблизно за останні <b>{ONLY_RECENT_MINUTES} хв.</b>\nТакож відсікаю ризики: <b>Zadowalający, uszkodzony, pęknięty, iCloud/Apple ID lock</b>\nІ відкидаю аксесуари: <b>etui, folia, szkło, ładowarka, pasek</b>\nФільтр спрощений: перевіряю назву + опис + бренд, а фінальну оцінку дає AI.
 
 <b>Команди:</b>
 
@@ -1771,6 +2003,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 /check
 /filter ID
 /refreshfilter ID
+/debugsearch ID
 /debug ipad
 /help
 
@@ -1807,12 +2040,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 7. Перегенерувати AI-фільтр:
 <code>/refreshfilter 3</code>
+<code>/debugsearch 3</code> — показати, чому останні raw-офери проходять або відсікаються
 
 8. Тест Vinted direct:
 <code>/debug ipad</code>
 
 <b>Фільтр свіжості:</b>
-тільки останні {ONLY_RECENT_MINUTES} хв.
+останні {ONLY_RECENT_MINUTES} хв.
 
 <b>Формати /add:</b>
 <code>/add ipad до 1200</code>
@@ -1961,7 +2195,7 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await message.reply_text("У тебе немає активних пошуків. Додай: /add ipad до 1200")
         return
 
-    await message.reply_text(f"🔍 Перевіряю Vinted. Беру тільки останні {ONLY_RECENT_MINUTES} хв...")
+    await message.reply_text(f"🔍 Перевіряю Vinted. Вікно свіжості: останні {ONLY_RECENT_MINUTES} хв. Беру до {MAX_ITEMS_PER_SEARCH} оголошень на пошук...")
 
     total_sent = 0
 
@@ -2026,6 +2260,61 @@ product_reason: {escape(product_reason)}
     except Exception as e:
         await message.reply_text(f"Debug error: {e}")
 
+
+
+async def debugsearch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show why latest raw Vinted items for one saved search are kept or skipped."""
+    chat = update.effective_chat
+    message = update.message
+    if not chat or not message:
+        return
+
+    telegram_id = str(chat.id)
+    if not context.args or not context.args[0].isdigit():
+        await message.reply_text("Напиши так: /debugsearch 21")
+        return
+
+    search = get_search_by_id(int(context.args[0]), telegram_id)
+    if not search:
+        await message.reply_text("Не знайшов такого пошуку.")
+        return
+
+    keyword = str(search.get("vinted_query") or search.get("keyword") or "").strip()
+    max_price = search.get("max_price")
+
+    await message.reply_text(f"🔬 Діагностика #{search.get('id')}: {keyword}\nБеру raw items з Vinted і показую, що бот з ними робить.")
+
+    try:
+        raw_items = direct_vinted_request(keyword, max_price)
+        if not raw_items:
+            await message.reply_text("Vinted повернув 0 raw items. Можливо, Vinted API тимчасово не віддає результати або запит занадто вузький.")
+            return
+
+        lines = [f"🔬 <b>Debug search #{escape(search.get('id'))}</b>", f"Raw items: {len(raw_items)}", ""]
+        for idx, raw in enumerate(raw_items[:10], start=1):
+            if not isinstance(raw, dict):
+                continue
+            item = normalize_vinted_direct_item(raw)
+            recent_ok, recent_reason = is_recent_item(raw)
+            quality_ok, quality_reason = passes_quality_filter(raw)
+            product_ok, product_reason = passes_dynamic_ai_filter(raw, search)
+            status = "✅ піде на AI" if (recent_ok and quality_ok and product_ok) else "⛔ буде пропущено"
+            lines.append(
+                f"<b>{idx}. {escape(item.get('title') or '—')}</b>\n"
+                f"💰 {escape(item.get('price') or '—')} | 🕒 {escape(recent_reason)}\n"
+                f"{status}\n"
+                f"quality: {escape(quality_reason)}\n"
+                f"product: {escape(product_reason)}\n"
+            )
+
+        text = "\n".join(lines)
+        if len(text) > 3900:
+            text = text[:3900] + "\n...обрізав, бо Telegram має ліміт повідомлення."
+        await message.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    except VintedFetchError as e:
+        await message.reply_text(f"⚠️ Vinted problem: {escape(e.kind)}\n{escape(e.message)}", parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await message.reply_text(f"Debugsearch error: {e}")
 
 
 async def filter_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2273,6 +2562,7 @@ def main() -> None:
     application.add_handler(CommandHandler("filter", filter_command))
     application.add_handler(CommandHandler("refreshfilter", refreshfilter_command))
     application.add_handler(CommandHandler("debug", debug_command))
+    application.add_handler(CommandHandler("debugsearch", debugsearch_command))
     application.add_handler(CallbackQueryHandler(feedback_callback, pattern=r"^fb\|"))
 
     application.job_queue.run_repeating(
