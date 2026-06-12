@@ -772,36 +772,69 @@ def text_contains_all_groups(text: str, groups: Any) -> Tuple[bool, str]:
 
 
 def infer_query_category(keyword: str) -> str:
-    """Small local classifier used only as a safety net around the AI-generated filter."""
+    """Local category classifier used as a hard safety net around the AI-generated filter.
+
+    Important: watches must be detected before generic electronics, otherwise
+    queries like "Apple Watch 10" can accidentally inherit iPad rules.
+    """
     k = (keyword or "").lower()
 
-    electronics = ["ipad", "iphone", "apple watch", "watch se", "macbook", "airpods", "redmi pad", "tablet", "telefon", "smartfon", "laptop", "kamera", "aparat", "konsola", "ps5", "xbox", "switch"]
+    watch_terms = ["apple watch", "iwatch", "zegarek", "zegarek apple", "watch se", "watch series", "series 9", "series 10", "g-shock", "casio", "seiko", "garmin", "smartwatch"]
     footwear = ["buty", "sneakers", "sneaker", "nike", "adidas", "dunk", "jordan", "yeezy", "air force", "new balance", "asics", "puma", "reebok", "vans", "converse", "trampki"]
-    clothing = ["kurtka", "bluza", "hoodie", "spodnie", "koszulka", "t-shirt", "tshirt", "sweter", "sukienka", "płaszcz", "plaszcz", "czapka", "czapeczka"]
-    collectibles = ["funko", "pop", "figurka", "figurki", "lego", "pokemon", "karta", "karty", "hot wheels", "manga", "komiks", "resorak", "model", "zabawka"]
-    watches = ["zegarek", "watch", "g-shock", "casio", "seiko", "garmin", "smartwatch"]
-    beauty = ["perfumy", "kosmetyk", "kosmetyki", "krem", "serum", "makeup", "makijaż", "makijaz"]
-    bags = ["plecak", "torba", "torebka", "portfel", "walizka"]
+    clothing = ["kurtka", "bluza", "hoodie", "spodnie", "koszulka", "t-shirt", "tshirt", "sweter", "sukienka", "płaszcz", "plaszcz", "czapka", "czapeczka", "tech fleece"]
+    collectibles = ["funko", "pop", "figurka", "figurki", "lego", "pokemon", "pokémon", "karta", "karty", "hot wheels", "manga", "komiks", "resorak", "model", "zabawka", "figurine"]
+    beauty = ["perfumy", "kosmetyk", "kosmetyki", "krem", "serum", "makeup", "makijaż", "makijaz", "pomadka", "paleta"]
+    bags = ["plecak", "torba", "torebka", "portfel", "walizka", "nerka", "saszetka"]
+    books = ["książka", "ksiazka", "book", "księga", "manga tom", "komiks tom"]
+    home = ["lampa", "krzesło", "krzeslo", "stolik", "dywan", "pościel", "posciel", "kubek", "talerz"]
+    electronics = ["ipad", "iphone", "macbook", "airpods", "redmi pad", "tablet", "telefon", "smartfon", "laptop", "kamera", "aparat", "konsola", "ps5", "xbox", "switch", "kindle"]
 
     def any_in(words):
         return any(w in k for w in words)
 
-    if any_in(electronics):
-        return "electronics"
+    if any_in(watch_terms):
+        return "watches"
     if any_in(footwear):
         return "footwear"
     if any_in(collectibles):
         return "collectibles"
-    if any_in(watches):
-        return "watches"
     if any_in(beauty):
         return "beauty"
     if any_in(bags):
         return "bags"
+    if any_in(books):
+        return "books"
+    if any_in(home):
+        return "home"
     if any_in(clothing):
         return "clothing"
+    if any_in(electronics):
+        return "electronics"
     return "generic"
 
+
+def infer_product_intent(keyword: str) -> str:
+    """More specific product family used to stop cross-product leaks inside one broad area."""
+    k = (keyword or "").lower()
+    if "apple watch" in k or "iwatch" in k or "watch series" in k:
+        return "apple_watch"
+    if "ipad" in k or "i pad" in k:
+        return "ipad"
+    if "iphone" in k:
+        return "iphone"
+    if "airpods" in k:
+        return "airpods"
+    if "macbook" in k:
+        return "macbook"
+    if "redmi pad" in k or ("redmi" in k and "pad" in k):
+        return "redmi_pad"
+    if "funko" in k or " pop" in f" {k}" or k.startswith("pop "):
+        return "funko_pop"
+    if "lego" in k:
+        return "lego"
+    if "nike" in k and "dunk" in k:
+        return "nike_dunk"
+    return infer_query_category(keyword)
 
 def build_ai_filter_prompt(keyword: str, max_price: Optional[float]) -> str:
     category_hint = infer_query_category(keyword)
@@ -816,7 +849,7 @@ def build_ai_filter_prompt(keyword: str, max_price: Optional[float]) -> str:
 
 Поверни ТІЛЬКИ валідний JSON без markdown. Формат:
 {{
-  "product_category": "electronics / footwear / clothing / collectibles / watches / beauty / bags / toys / books / home / generic",
+  "product_category": "electronics / watches / footwear / clothing / collectibles / beauty / bags / toys / books / home / generic",
   "vinted_query": "короткий пошуковий запит для Vinted польською/англійською, без ціни",
   "filter_summary_ua": "коротко українською що саме шукаємо і що відсікаємо; без вигаданих гарантій/чеків",
   "required_groups": [
@@ -834,6 +867,8 @@ def build_ai_filter_prompt(keyword: str, max_price: Optional[float]) -> str:
 ГОЛОВНЕ ПРАВИЛО:
 - НІКОЛИ не використовуй правила від іншої категорії.
 - Якщо користувач шукає кросівки Nike Dunk Low — НЕ додавай ipad, tablet, iCloud, Apple ID, 10 gen, A2696, A2757, 10.9.
+- Якщо користувач шукає Apple Watch — НЕ додавай iPad-ознаки: 10.9, 10,9, A2696, A2757, A2777, tablet, iPad.
+- Якщо користувач шукає Apple Watch Series 9/10 — модельні слова мають бути Series 9/Series 10, S9/S10, а НЕ iPad 10 gen або iPad 2022.
 - Якщо користувач шукає Funko Pop або фігурку — НЕ додавай технічні фільтри типу iCloud/ładowarka/Apple ID.
 - Якщо користувач шукає одяг/взуття — НЕ відсікай charger, iCloud, kabel, якщо це не має сенсу для категорії.
 
@@ -888,11 +923,20 @@ E) Запит: ipad 10 gen do 1000
 - quality_risk_any: ["icloud", "apple id", "blokada", "uszkodzony", "pęknięty", "zbity", "nie działa"]
 
 F) Запит: apple watch se 2 do 400
-- product_category: electronics
+- product_category: watches
 - vinted_query: "apple watch se"
 - required_groups: [["apple watch", "watch"], ["se"], ["2 gen", "2 generacji", "2. generacji", "drugiej generacji", "2022", "2023", "se 2", "se2"]]
 - reject_any: ["pasek", "strap", "bransoleta", "etui", "szkło", "ładowarka", "kabel", "pudełko"]
-- quality_risk_any: ["icloud", "apple id", "blokada", "uszkodzony", "pęknięty", "zbity", "nie działa", "kondycja baterii"]
+- quality_risk_any: ["blokada", "uszkodzony", "pęknięty", "zbity", "nie działa", "kondycja baterii"]
+
+
+G) Запит: apple watch 10 do 1100
+- product_category: watches
+- vinted_query: "apple watch 10"
+- required_groups: [["apple watch", "watch"], ["series 10", "s10", "10"]]
+- reject_any: ["pasek", "strap", "bransoleta", "etui", "szkło", "folia", "ładowarka", "kabel", "pudełko samo", "samo pudełko"]
+- wrong_product_any: ["series 8", "series 7", "series 6", "se", "ultra"]
+- quality_risk_any: ["blokada", "uszkodzony", "pęknięty", "zbity", "nie działa", "nie dziala", "digital crown", "kondycja baterii"]
 """.strip()
 
 
@@ -945,11 +989,46 @@ def local_category_filter(keyword: str, max_price: Optional[float]) -> Dict[str,
             "message_to_seller_pl": "Cześć, czy figurka jest oryginalna i w jakim stanie jest pudełko? Czy możesz wysłać dodatkowe zdjęcia z każdej strony?"
         }
 
-    if category in ["clothing", "bags", "beauty", "watches"]:
+    if category == "watches":
+        required = []
+        vinted_query = keyword
+        wrong = []
+        kl = k.replace("series", "").strip()
+        if "apple watch" in k or "iwatch" in k:
+            required.append(["apple watch", "watch"])
+            if "se" in k:
+                required.append(["se"])
+                if "2" in k or "drug" in k:
+                    required.append(["2 gen", "2 generacji", "2. generacji", "drugiej generacji", "2022", "2023", "se 2", "se2"])
+                vinted_query = "apple watch se"
+            elif "10" in k:
+                required.append(["series 10", "s10", "10"])
+                vinted_query = "apple watch 10"
+                wrong = ["series 9", "series 8", "series 7", "series 6", "se", "ultra"]
+            elif "9" in k:
+                required.append(["series 9", "s9", "9"])
+                vinted_query = "apple watch 9"
+                wrong = ["series 10", "series 8", "series 7", "series 6", "se", "ultra"]
+        if not required and keyword:
+            required = [[keyword]]
+        return {
+            "product_category": "watches",
+            "vinted_query": vinted_query,
+            "filter_summary_ua": "Шукаю годинник з твого запиту, відсікаю ремінці, чохли, зарядки, коробки та явно інші моделі.",
+            "required_groups": required,
+            "include_any": ["koperta", "mm", "gps", "cellular", "kondycja baterii"],
+            "reject_any": reject_common_market_noise + ["pasek", "strap", "bransoleta", "etui", "case", "szkło", "szklo", "folia", "ładowarka", "ladowarka", "kabel", "pudełko samo", "samo pudełko", "samo pudelko"],
+            "wrong_product_any": wrong,
+            "quality_risk_any": ["blokada", "icloud", "apple id", "uszkodzony", "pęknięty", "pekniety", "zbity", "nie działa", "nie dziala", "digital crown", "bateria słaba", "slaba bateria", "nie paruje"],
+            "min_ai_score": MIN_AI_SCORE_TO_SEND,
+            "message_to_seller_pl": "Cześć, czy zegarek jest w pełni sprawny, wylogowany z Apple ID i jaka jest kondycja baterii?"
+        }
+
+    if category in ["clothing", "bags", "beauty", "books", "home"]:
         return {
             "product_category": category,
             "vinted_query": keyword,
-            "filter_summary_ua": "Szuka товару з твого запиту, відсікає очевидно неправильні речі та ризиковий стан.",
+            "filter_summary_ua": "Шукаю товар з твого запиту, відсікаю очевидно неправильні речі та ризиковий стан.",
             "required_groups": [[keyword]] if keyword else [],
             "include_any": [],
             "reject_any": reject_common_market_noise,
@@ -979,16 +1058,66 @@ def local_category_filter(keyword: str, max_price: Optional[float]) -> Dict[str,
     }
 
 
-def filter_has_category_leak(keyword: str, data: Dict[str, Any]) -> bool:
-    """Detect cases where the LLM accidentally uses iPad/electronics rules for shoes, Funko, clothes, etc."""
-    category = infer_query_category(keyword)
-    if category in ["electronics", "generic"]:
-        return False
-    serialized = json.dumps(data, ensure_ascii=False).lower()
-    tech_leaks = ["ipad", "iphone", "icloud", "apple id", "a2696", "a2757", "a2777", "10.9", "10,9", "ładowarka", "ladowarka", "charger", "kabel"]
-    # apple/nike may coexist in brand names, so only count strong tech leakage.
-    return any(x in serialized for x in tech_leaks)
+CATEGORY_FORBIDDEN_TERMS = {
+    "footwear": ["ipad", "iphone", "icloud", "apple id", "a2696", "a2757", "a2777", "10.9", "10,9", "ładowarka", "ladowarka", "charger", "kabel", "tablet", "macbook"],
+    "collectibles": ["ipad", "iphone", "icloud", "apple id", "a2696", "a2757", "a2777", "10.9", "10,9", "ładowarka", "ladowarka", "charger", "kabel", "tablet"],
+    "clothing": ["ipad", "iphone", "icloud", "apple id", "a2696", "a2757", "a2777", "10.9", "10,9", "ładowarka", "ladowarka", "charger", "kabel", "tablet"],
+    "bags": ["ipad", "iphone", "icloud", "apple id", "a2696", "a2757", "a2777", "10.9", "10,9", "ładowarka", "ladowarka", "charger", "kabel", "tablet"],
+    "beauty": ["ipad", "iphone", "icloud", "apple id", "a2696", "a2757", "a2777", "10.9", "10,9", "ładowarka", "ladowarka", "charger", "kabel", "tablet"],
+    "books": ["ipad", "iphone", "icloud", "apple id", "a2696", "a2757", "a2777", "10.9", "10,9", "ładowarka", "ladowarka", "charger", "kabel", "tablet"],
+    "home": ["ipad", "iphone", "icloud", "apple id", "a2696", "a2757", "a2777", "10.9", "10,9", "ładowarka", "ladowarka", "charger", "kabel", "tablet"],
+    # Apple Watch can mention iCloud/Apple ID as risk, but must never inherit iPad model codes.
+    "watches": ["ipad", "i pad", "tablet", "a2696", "a2757", "a2777", "10.9", "10,9", "rysik", "klawiatura"],
+}
 
+INTENT_FORBIDDEN_TERMS = {
+    "apple_watch": ["ipad", "i pad", "tablet", "a2696", "a2757", "a2777", "10.9", "10,9", "10 gen", "10 generacji", "10th generation", "rysik", "klawiatura"],
+    "ipad": ["pasek", "strap", "bransoleta", "series 9", "series 10", "apple watch", "watch se", "samo pasek"],
+    "nike_dunk": ["ipad", "i pad", "tablet", "icloud", "apple id", "a2696", "a2757", "a2777", "10.9", "10,9", "ładowarka", "ladowarka", "charger", "kabel"],
+    "funko_pop": ["ipad", "i pad", "tablet", "icloud", "apple id", "a2696", "a2757", "a2777", "10.9", "10,9", "ładowarka", "ladowarka", "charger", "kabel"],
+    "lego": ["ipad", "i pad", "tablet", "icloud", "apple id", "a2696", "a2757", "a2777", "10.9", "10,9", "ładowarka", "ladowarka", "charger", "kabel"],
+}
+
+
+def flatten_filter_terms(data: Dict[str, Any]) -> str:
+    return json.dumps(data, ensure_ascii=False).lower()
+
+
+def filter_has_category_leak(keyword: str, data: Dict[str, Any]) -> bool:
+    """Detect AI filters that mixed rules from another category/product family."""
+    category = infer_query_category(keyword)
+    intent = infer_product_intent(keyword)
+    serialized = flatten_filter_terms(data)
+    forbidden = set(CATEGORY_FORBIDDEN_TERMS.get(category, [])) | set(INTENT_FORBIDDEN_TERMS.get(intent, []))
+    return any(term and term in serialized for term in forbidden)
+
+
+def force_local_category_consistency(keyword: str, data: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep the AI output, but force category/product-family consistency.
+
+    If the AI output contains strong foreign-category terms, fallback is safer than
+    trying to surgically fix a poisoned required_groups list.
+    """
+    local_category = infer_query_category(keyword)
+    data["product_category"] = local_category
+
+    # Keep Vinted query short and close to the user's intent.
+    vq = str(data.get("vinted_query") or keyword).lower()
+    if filter_has_category_leak(keyword, {"vinted_query": vq}):
+        data["vinted_query"] = local_category_filter(keyword, None).get("vinted_query", keyword)
+
+    # A strong leak anywhere in required/wrong/reject means the full filter is unreliable.
+    risky_parts = {
+        "required_groups": data.get("required_groups"),
+        "reject_any": data.get("reject_any"),
+        "wrong_product_any": data.get("wrong_product_any"),
+        "include_any": data.get("include_any"),
+    }
+    if filter_has_category_leak(keyword, risky_parts):
+        logger.warning("AI filter category/product leak detected for keyword=%s. Using local category fallback.", keyword)
+        return local_category_filter(keyword, None)
+
+    return data
 
 def move_minor_wear_from_reject_to_risk(data: Dict[str, Any]) -> Dict[str, Any]:
     if not SOFTEN_MINOR_WEAR_WORDS:
@@ -1023,6 +1152,7 @@ def move_minor_wear_from_reject_to_risk(data: Dict[str, Any]) -> Dict[str, Any]:
 def sanitize_ai_filter(keyword: str, data: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(data, dict):
         return local_category_filter(keyword, None)
+
     data.setdefault("product_category", infer_query_category(keyword))
     data.setdefault("vinted_query", keyword)
     data.setdefault("filter_summary_ua", "AI створив фільтр для цього пошуку.")
@@ -1034,12 +1164,15 @@ def sanitize_ai_filter(keyword: str, data: Dict[str, Any]) -> Dict[str, Any]:
     data.setdefault("min_ai_score", MIN_AI_SCORE_TO_SEND)
     data.setdefault("message_to_seller_pl", "Cześć, czy oferta jest aktualna? Czy możesz wysłać więcej informacji i zdjęć?")
 
-    if filter_has_category_leak(keyword, data):
-        logger.warning("AI filter category leak detected for keyword=%s. Using local category fallback.", keyword)
-        return local_category_filter(keyword, None)
+    data = move_minor_wear_from_reject_to_risk(data)
+    data = force_local_category_consistency(keyword, data)
+
+    # Final safety: if AI produced empty required groups, use local fallback groups.
+    if not as_list(data.get("required_groups")):
+        local = local_category_filter(keyword, None)
+        data["required_groups"] = local.get("required_groups", [[keyword.lower()]])
 
     return data
-
 
 def fallback_filter(keyword: str, max_price: Optional[float]) -> Dict[str, Any]:
     return local_category_filter(keyword, max_price)
@@ -1071,7 +1204,7 @@ def generate_filter_with_ai(keyword: str, max_price: Optional[float]) -> Dict[st
         data.setdefault("quality_risk_any", [])
         data.setdefault("min_ai_score", MIN_AI_SCORE_TO_SEND)
         data.setdefault("message_to_seller_pl", "Dzień dobry, czy oferta jest aktualna i czy przedmiot jest w pełni sprawny?")
-        return data
+        return sanitize_ai_filter(keyword, data)
     except Exception as e:
         logger.error("AI filter generation failed: %s", e)
         return fallback_filter(keyword, max_price)
