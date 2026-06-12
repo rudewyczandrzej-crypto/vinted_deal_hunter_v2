@@ -44,13 +44,22 @@ EMPTY_ALERT_THRESHOLD_CYCLES = int(os.getenv("EMPTY_ALERT_THRESHOLD_CYCLES", "3"
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant").strip()
 
-BOT_VERSION = "v13_stable_antispam_no_autolearn_2026_06_12"
+BOT_VERSION = "v14_ai_judge_mode_2026_06_12"
 
 # v13 Stable Anti-Spam Mode:
 # Previous catch-all patches were useful for debugging, but they could spam many old/weak offers.
 # Stable mode keeps broad search, but caps freshness/items and requires stronger AI + deal scores.
 STABLE_SEND_MODE = os.getenv("STABLE_SEND_MODE", "true").lower() in ["1", "true", "yes", "y"]
 CATCH_ALL_MODE = os.getenv("CATCH_ALL_MODE", "false").lower() in ["1", "true", "yes", "y"]
+
+# v14 AI Judge Mode:
+# Stop using complex filter_json rules as the main brain.
+# Local code only does cheap safety gates: freshness, price, duplicates, obvious accessory-only titles.
+# Groq AI decides if the listing is actually the target product and whether it should be sent.
+AI_JUDGE_MODE = os.getenv("AI_JUDGE_MODE", "true").lower() in ["1", "true", "yes", "y"]
+MIN_TARGET_CONFIDENCE_RAW = int(os.getenv("MIN_TARGET_CONFIDENCE", "7"))
+MIN_EFFECTIVE_TARGET_CONFIDENCE = int(os.getenv("MIN_EFFECTIVE_TARGET_CONFIDENCE", "7"))
+MIN_TARGET_CONFIDENCE = max(MIN_TARGET_CONFIDENCE_RAW, MIN_EFFECTIVE_TARGET_CONFIDENCE) if STABLE_SEND_MODE else MIN_TARGET_CONFIDENCE_RAW
 
 # In stable mode, old Railway variables like ONLY_RECENT_MINUTES=360 are capped.
 MIN_EFFECTIVE_RECENT_MINUTES = int(os.getenv("MIN_EFFECTIVE_RECENT_MINUTES", "30"))
@@ -1530,15 +1539,29 @@ def generate_filter_with_ai(keyword: str, max_price: Optional[float]) -> Dict[st
 
 def passes_dynamic_ai_filter(raw: Dict[str, Any], search: Dict[str, Any]) -> Tuple[bool, str]:
     profile = get_filter_profile(search)
+    keyword = search.get("keyword", "")
+
+    if AI_JUDGE_MODE:
+        # v14: local filters should not decide whether it is an iPad/Watch/Funko/etc.
+        # They only block obvious accessory-only listings, because sending every pasek/etui would waste AI tokens.
+        # Examples blocked: "pasek do Apple Watch", "samo pudełko", "tylko ładowarka".
+        # Examples allowed to AI: "Apple Watch + pasek i ładowarka", "iPad z etui".
+        if not profile:
+            profile = {"product_category": infer_query_category(keyword)}
+        accessory_reason = accessory_only_reason(raw, profile, keyword)
+        if accessory_reason:
+            return False, f"AI Judge prefilter: {accessory_reason}"
+        return True, "AI Judge Mode: product decision delegated to AI"
+
     if not profile:
         # Old searches without generated filter still work with old generic filtering.
-        return passes_product_profile_filter(raw, search.get("keyword", ""))
+        return passes_product_profile_filter(raw, keyword)
 
     text = item_searchable_text(raw)
     title = str(get_first_existing(raw, ["title", "name", "itemTitle", "productTitle"], "")).lower()
     combined = f"{title} | {text}".lower()
 
-    accessory_reason = accessory_only_reason(raw, profile, search.get("keyword", ""))
+    accessory_reason = accessory_only_reason(raw, profile, keyword)
     if accessory_reason:
         return False, accessory_reason
 
@@ -2262,20 +2285,29 @@ def evaluate_item_with_ai(item: Dict[str, Any], search: Dict[str, Any]) -> Dict[
         images_info = "є мінімум одне фото"
 
     prompt = f"""
-Ти AI-агент для оцінки оголошень з Vinted у Польщі.
+Ти AI Judge для Telegram-бота, який шукає вигідні оферти на Vinted у Польщі.
+
+Твоя головна задача — мислити як уважний покупець, а не як механічний keyword-фільтр.
+Користувач задає людський запит, наприклад: "apple watch se 2 до 400", "ipad a16 до 1500", "nike dunk low до 150", "funko pop до 60".
+Ти маєш визначити, чи оголошення реально відповідає запиту користувача.
 
 ВАЖЛИВО:
-- Ти НЕ бачиш фото напряму.
-- Не відсікай автоматично хороший дешевий товар тільки через дрібні подряпини; познач це як ризик.
-- Оцінюй товар відповідно до його категорії: техніка, взуття, одяг, колекційні фігурки/Funko/Lego, косметика, сумки тощо.
-- Для техніки перевіряй правильну модель, блокування акаунта, стан екрана, батарею якщо доступно.
-- Для взуття перевіряй оригінальність, модель, розмір якщо вказаний, стан підошви/верху.
-- Для Funko/фігурок/Lego перевіряй оригінальність, комплектність, стан коробки, чи це не плакат/наклейка/одяг.
-- Deal score — це не те саме, що безпека. Дешевий товар з дрібним ризиком може мати високий deal_score, але нижчий safety score.
+- Ти НЕ бачиш фото напряму, тільки текст/дані з Vinted API.
+- Якщо у назві/описі є аксесуари в комплекті, це НЕ означає, що товар неправильний.
+  Наприклад "Apple Watch + pasek i ładowarka" = це може бути нормальний годинник з комплектом.
+- Але "pasek do Apple Watch", "samo pudełko", "tylko ładowarka" = не той товар.
+- Якщо продавець пише "Apple Watch SE (gen2)", "SE gen2", "SE2", "2 generacji" — це підходить для Apple Watch SE 2.
+- Якщо користувач шукає Apple Watch Series 10, то SE / Series 9 / Ultra — не той товар.
+- Якщо користувач шукає iPad A16 / iPad 11 / iPad 2025, старі iPad 9/10/mini/pro можуть бути не тим товаром, якщо явно не збігаються.
+- Якщо користувач шукає Funko Pop, не плутай з футболкою, плакатом, книгою чи брелком.
+- Якщо користувач шукає Nike Dunk Low, не плутай з Dunk High, Jordan, Air Force або аксесуарами.
+- Дрібні ryski/ślady użytkowania — це ризик, але не завжди причина не слати, якщо ціна добра.
+- iCloud / Apple ID lock / blokada / nie działa / uszkodzony / części — сильний ризик для техніки.
+- Deal score — це вигідність ціни, а score — відповідність + безпека.
 
-Задача користувача:
-- шукає: {search.get("keyword")}
-- максимальна ціна: {search.get("max_price")} PLN
+Пошук користувача:
+- keyword: {search.get("keyword")}
+- max_price: {search.get("max_price")} PLN
 
 Оголошення:
 - title: {item.get("title")}
@@ -2286,27 +2318,34 @@ def evaluate_item_with_ai(item: Dict[str, Any], search: Dict[str, Any]) -> Dict[
 - seller: {item.get("seller")}
 - location: {item.get("location")}
 - age_minutes: {item.get("age_minutes")}
+- query_used: {item.get("query_used")}
 - images_info: {images_info}
 - description: {item.get("description")}
 - url: {item.get("url")}
 
 Оціни оголошення.
-score 0-10 = наскільки товар підходить і безпечний.
-deal_score 0-10 = наскільки це вигідна ціна/угода для такого товару.
 
-Ризики:
-- Для техніки: uszkodzony / nie działa / części / iCloud / blokada / pęknięty ekran = сильний ризик.
-- Для взуття: podróbka/fake/replika, dziura, odklejona podeszwa, дуже знищений стан = сильний ризик.
-- Для Funko/фігурок/Lego: fake, brak pudełka, uszkodzone pudełko, niekompletne, braki = ризик, але не завжди автоматичний бан.
-- ryski / drobne rysy = мʼякий ризик, не обовʼязково погана оферта.
-- занадто короткий опис або мало фото = мʼякий/середній ризик.
+Поля:
+- is_target_product: true/false — чи це реально той товар, який шукає користувач.
+- target_confidence: 0-10 — наскільки ти впевнений, що це той товар.
+- should_send: true/false — чи варто відправити це користувачу зараз.
+- score: 0-10 — відповідність запиту + безпека.
+- deal_score: 0-10 — вигідність ціни/угоди.
+
+Правило відправки:
+- should_send=true тільки якщо це схоже на правильний товар і є сенс показати користувачу.
+- Якщо це не той товар — is_target_product=false, should_send=false, навіть якщо ціна низька.
+- Якщо це правильний товар, але є ризики, можеш should_send=true з поясненням ризиків.
 
 Відповідай тільки JSON без markdown:
 {{
-  "score": 0-10,
-  "deal_score": 0-10,
-  "verdict": "дуже вигідна / хороша / нормальна / ризикована / не варто",
-  "reason": "коротке пояснення українською",
+  "is_target_product": true,
+  "target_confidence": 0,
+  "should_send": true,
+  "score": 0,
+  "deal_score": 0,
+  "verdict": "дуже вигідна / хороша / нормальна / ризикована / не варто / не той товар",
+  "reason": "коротко українською чому це підходить або не підходить",
   "deal_reason": "чому такий deal_score українською",
   "risk_flags": ["..."],
   "message_to_seller_pl": "коротке повідомлення польською до продавця"
@@ -2317,18 +2356,27 @@ deal_score 0-10 = наскільки це вигідна ціна/угода д�
         completion = groq_client.chat.completions.create(
             model=GROQ_MODEL,
             messages=[
-                {"role": "system", "content": "You are a careful marketplace deal evaluator. Return valid JSON only."},
+                {"role": "system", "content": "You are an AI marketplace judge. Decide if a Vinted listing matches the user's exact intent. Return valid JSON only."},
                 {"role": "user", "content": prompt},
             ],
-            temperature=0.2,
+            temperature=0.1,
         )
 
         content = completion.choices[0].message.content or "{}"
         result = safe_json_loads(content)
 
+        is_target = bool(result.get("is_target_product", result.get("is_target", False)))
+        target_confidence = int(result.get("target_confidence", result.get("confidence", 0)) or 0)
+        score = int(result.get("score", 0) or 0)
+        deal_score = int(result.get("deal_score", result.get("score", 0)) or 0)
+        should_send = bool(result.get("should_send", is_target and target_confidence >= MIN_TARGET_CONFIDENCE and score >= MIN_AI_SCORE_TO_SEND))
+
         return {
-            "score": int(result.get("score", 0)),
-            "deal_score": int(result.get("deal_score", result.get("score", 0))),
+            "is_target_product": is_target,
+            "target_confidence": target_confidence,
+            "should_send": should_send,
+            "score": score,
+            "deal_score": deal_score,
             "verdict": str(result.get("verdict", "н/д")),
             "reason": str(result.get("reason", "")),
             "deal_reason": str(result.get("deal_reason", "")),
@@ -2338,7 +2386,24 @@ deal_score 0-10 = наскільки це вигідна ціна/угода д�
 
     except Exception as e:
         logger.error("Groq AI evaluation failed: %s", e)
+        # In AI Judge Mode, do NOT spam when the judge failed. Skip safely.
+        if AI_JUDGE_MODE:
+            return {
+                "is_target_product": False,
+                "target_confidence": 0,
+                "should_send": False,
+                "score": 0,
+                "deal_score": 0,
+                "verdict": "AI Judge не спрацював",
+                "reason": "AI-оцінка Groq не спрацювала, тому не відправляю оголошення, щоб не спамити.",
+                "deal_reason": "Немає AI-оцінки вигідності.",
+                "risk_flags": ["ai_error"],
+                "message_to_seller_pl": "Dzień dobry, czy oferta jest aktualna? Czy można prosić o więcej informacji o stanie przedmiotu?",
+            }
         return {
+            "is_target_product": True,
+            "target_confidence": 5,
+            "should_send": True,
             "score": 5,
             "deal_score": 5,
             "verdict": "не вдалося повністю оцінити",
@@ -2347,7 +2412,6 @@ deal_score 0-10 = наскільки це вигідна ціна/угода д�
             "risk_flags": [],
             "message_to_seller_pl": "Dzień dobry, czy oferta jest nadal aktualna? Czy można prosić o więcej zdjęć i informacje o stanie technicznym?",
         }
-
 
 # =========================
 # TELEGRAM MESSAGE FORMAT
@@ -2380,6 +2444,7 @@ def format_item_message(item: Dict[str, Any], ai: Dict[str, Any], search: Dict[s
 🏷 <b>Бренд:</b> {escape(item.get("brand") or "н/д")}
 📌 <b>Стан:</b> {escape(item.get("condition") or "н/д")}
 🕒 <b>Додано:</b> {escape(age_text)}
+🎯 <b>Це цільовий товар:</b> {"так" if ai.get("is_target_product") else "ні"} / впевненість {escape(ai.get("target_confidence", "н/д"))}/10
 
 🤖 <b>AI-оцінка:</b> {escape(ai.get("score"))}/10
 📊 <b>Deal score:</b> {escape(ai.get("deal_score"))}/10
@@ -2460,12 +2525,28 @@ async def process_search(
             ai = evaluate_item_with_ai(item, search)
             score = int(ai.get("score", 0))
             deal_score = int(ai.get("deal_score", 0))
-            # In catch-all/simple mode, old DB filters may contain min_ai_score=3/4 from older strict patches.
-            # Do not let old database records silently block offers.
-            if CATCH_ALL_MODE or SIMPLE_FILTER_MODE:
+
+            if AI_JUDGE_MODE:
+                is_target = bool(ai.get("is_target_product"))
+                confidence = int(ai.get("target_confidence", 0) or 0)
+                should_send = bool(ai.get("should_send"))
+                if not is_target:
+                    logger.info("AI Judge skipped non-target item WITHOUT marking sent: %s confidence=%s reason=%s", item.get("title"), confidence, ai.get("reason"))
+                    continue
+                if confidence < MIN_TARGET_CONFIDENCE:
+                    logger.info("AI Judge skipped low target confidence WITHOUT marking sent: %s confidence=%s min=%s reason=%s", item.get("title"), confidence, MIN_TARGET_CONFIDENCE, ai.get("reason"))
+                    continue
+                if not should_send:
+                    logger.info("AI Judge skipped should_send=false WITHOUT marking sent: %s score=%s deal=%s reason=%s", item.get("title"), score, deal_score, ai.get("reason"))
+                    continue
                 min_score = MIN_AI_SCORE_TO_SEND
             else:
-                min_score = int(search.get("min_ai_score") or get_filter_profile(search).get("min_ai_score") or MIN_AI_SCORE_TO_SEND)
+                # In catch-all/simple mode, old DB filters may contain min_ai_score=3/4 from older strict patches.
+                # Do not let old database records silently block offers.
+                if CATCH_ALL_MODE or SIMPLE_FILTER_MODE:
+                    min_score = MIN_AI_SCORE_TO_SEND
+                else:
+                    min_score = int(search.get("min_ai_score") or get_filter_profile(search).get("min_ai_score") or MIN_AI_SCORE_TO_SEND)
 
             if score < min_score:
                 logger.info("Skipped low AI score item WITHOUT marking sent: %s score=%s min=%s", item.get("title"), score, min_score)
@@ -2638,7 +2719,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     text = f"""
 👋 Привіт! Я <b>Vinted AI Deal Hunter</b>.
 
-Я шукаю свіжі оферти напряму на Vinted без Apify, оцінюю їх через Groq AI, рахую Deal score і вчуся на твоєму фідбеку.
+Я шукаю свіжі оферти напряму на Vinted без Apify. У v14 працює AI Judge Mode: складні фільтри майже не вирішують, головне рішення приймає AI по кожному оголошенню.
 
 <b>Зараз фільтр:</b>
 оголошення приблизно за останні <b>{ONLY_RECENT_MINUTES} хв.</b>\nТакож відсікаю ризики: <b>Zadowalający, uszkodzony, pęknięty, iCloud/Apple ID lock</b>\nІ відкидаю аксесуари: <b>etui, folia, szkło, ładowarka, pasek</b>\nФільтр спрощений: перевіряю назву + опис + бренд, а фінальну оцінку дає AI.
@@ -2847,7 +2928,12 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await message.reply_text("У тебе немає активних пошуків. Додай: /add ipad до 1200")
         return
 
-    await message.reply_text(f"🔍 Перевіряю Vinted. Версія: {BOT_VERSION}\nВікно: останні {ONLY_RECENT_MINUTES} хв (Railway raw: {ONLY_RECENT_MINUTES_RAW}). Беру до {MAX_ITEMS_PER_SEARCH} оголошень на варіант. Broad search: {BROAD_SEARCH_MODE}")
+    await message.reply_text(
+        f"🔍 Перевіряю Vinted. Версія: {BOT_VERSION}\n"
+        f"Вікно: останні {ONLY_RECENT_MINUTES} хв (Railway raw: {ONLY_RECENT_MINUTES_RAW}). "
+        f"Беру до {MAX_ITEMS_PER_SEARCH} оголошень на варіант. Broad search: {BROAD_SEARCH_MODE}\n"
+        f"AI Judge: {AI_JUDGE_MODE}, min confidence: {MIN_TARGET_CONFIDENCE}"
+    )
 
     total_sent = 0
 
@@ -2868,6 +2954,8 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     text = f"""🩺 <b>Vinted bot status</b>
 Версія: <code>{escape(BOT_VERSION)}</code>
 STABLE_SEND_MODE: <code>{STABLE_SEND_MODE}</code>
+AI_JUDGE_MODE: <code>{AI_JUDGE_MODE}</code>
+MIN_TARGET_CONFIDENCE: <code>{MIN_TARGET_CONFIDENCE}</code>
 CATCH_ALL_MODE: <code>{CATCH_ALL_MODE}</code>
 SIMPLE_FILTER_MODE: <code>{SIMPLE_FILTER_MODE}</code>
 BROAD_SEARCH_MODE: <code>{BROAD_SEARCH_MODE}</code>
@@ -3250,7 +3338,7 @@ def main() -> None:
     )
 
     init_vinted_session()
-    logger.info("Bot started. version=%s CATCH_ALL_MODE=%s BROAD_SEARCH_MODE=%s ONLY_RECENT_RAW=%s ONLY_RECENT_EFFECTIVE=%s SKIP_UNKNOWN_AGE=%s", BOT_VERSION, CATCH_ALL_MODE, BROAD_SEARCH_MODE, ONLY_RECENT_MINUTES_RAW, ONLY_RECENT_MINUTES, SKIP_UNKNOWN_AGE)
+    logger.info("Bot started. version=%s AI_JUDGE_MODE=%s MIN_TARGET_CONFIDENCE=%s CATCH_ALL_MODE=%s BROAD_SEARCH_MODE=%s ONLY_RECENT_RAW=%s ONLY_RECENT_EFFECTIVE=%s SKIP_UNKNOWN_AGE=%s", BOT_VERSION, AI_JUDGE_MODE, MIN_TARGET_CONFIDENCE, CATCH_ALL_MODE, BROAD_SEARCH_MODE, ONLY_RECENT_MINUTES_RAW, ONLY_RECENT_MINUTES, SKIP_UNKNOWN_AGE)
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
