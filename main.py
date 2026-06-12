@@ -46,7 +46,7 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant").strip()
 
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "300"))
 MAX_ITEMS_PER_SEARCH = int(os.getenv("MAX_ITEMS_PER_SEARCH", "50"))
-MIN_AI_SCORE_TO_SEND = int(os.getenv("MIN_AI_SCORE_TO_SEND", "3"))
+MIN_AI_SCORE_TO_SEND = int(os.getenv("MIN_AI_SCORE_TO_SEND", "2"))
 MIN_DEAL_SCORE_TO_SEND = int(os.getenv("MIN_DEAL_SCORE_TO_SEND", "0"))
 FEEDBACK_LEARNING_ENABLED = os.getenv("FEEDBACK_LEARNING_ENABLED", "true").lower() in ["1", "true", "yes", "y"]
 FEEDBACK_TYPES = {
@@ -62,9 +62,21 @@ FEEDBACK_TYPES = {
 DYNAMIC_AI_FILTERS_ENABLED = os.getenv("DYNAMIC_AI_FILTERS_ENABLED", "true").lower() in ["1", "true", "yes", "y"]
 FILTER_GENERATION_MODEL = os.getenv("FILTER_GENERATION_MODEL", GROQ_MODEL).strip()
 
+# v8 Simple Mode:
+# The old category filters became too strict and could silently skip good deals.
+# In Simple Mode, the database filter is mostly descriptive. The bot uses Vinted search + price + freshness,
+# then sends candidates to AI for scoring. Hard blocking is limited to clear accessory-only titles.
+SIMPLE_FILTER_MODE = os.getenv("SIMPLE_FILTER_MODE", "true").lower() in ["1", "true", "yes", "y"]
+# v9 Broad Search Mode:
+# Vinted search_text can miss good offers when the query is too exact, e.g.
+# "apple watch se 2" may not catch "Apple Watch SE (gen 2)".
+# This mode queries a few broad variants and lets AI/deal score decide.
+BROAD_SEARCH_MODE = os.getenv("BROAD_SEARCH_MODE", "true").lower() in ["1", "true", "yes", "y"]
+MAX_QUERY_VARIANTS = int(os.getenv("MAX_QUERY_VARIANTS", "5"))
+
 
 # New freshness filter.
-ONLY_RECENT_MINUTES = int(os.getenv("ONLY_RECENT_MINUTES", "60"))
+ONLY_RECENT_MINUTES = int(os.getenv("ONLY_RECENT_MINUTES", "360"))
 
 # If Apify does not return age/date:
 # true  = skip item, safer, avoids old listings
@@ -687,6 +699,9 @@ def accessory_only_reason(raw: Dict[str, Any], profile: Dict[str, Any], search_k
 
 
 def passes_product_profile_filter(raw: Dict[str, Any], search_keyword: str) -> Tuple[bool, str]:
+    if SIMPLE_FILTER_MODE:
+        return True, "simple mode: legacy product filter bypassed"
+
     """
     Simpler product filter:
     - uses title + description + brand + raw text from Vinted
@@ -748,7 +763,8 @@ def passes_product_profile_filter(raw: Dict[str, Any], search_keyword: str) -> T
         # SE 2 allowlist. This is intentionally stricter than before.
         # Plain "Apple Watch SE 40mm" is probably SE 1, so reject it.
         se2_hints = [
-            "se 2", "se2", "se 2gen", "se 2 gen", "se gen 2",
+            "se 2", "se2", "se 2gen", "se 2 gen", "se gen 2", "se gen2",
+            "gen2", "gen 2", "2gen", "2 gen", "se (gen2)",
             "se 2 generacji", "se 2. generacji",
             "2 generacji", "2. generacji", "drugiej generacji",
             "2nd gen", "2nd generation", "second generation",
@@ -835,6 +851,7 @@ def normalize_item(raw: Dict[str, Any]) -> Dict[str, Any]:
         "images": images,
         "age_minutes": age_minutes,
         "age_source": age_source,
+        "query_used": str(raw.get("_vinted_query_used", "")),
         "raw": raw,
     }
 
@@ -866,11 +883,73 @@ def get_filter_profile(search: Dict[str, Any]) -> Dict[str, Any]:
     return {}
 
 
+def compact_match_text(value: str) -> str:
+    """
+    Compact text for tolerant matching.
+
+    Vinted sellers often write the same model in different ways:
+    - SE 2
+    - SE2
+    - SE (gen2)
+    - SE gen 2
+    - 2 generacji
+
+    Normal substring matching misses some of these. This helper removes
+    punctuation/spaces so required groups can still match obvious variants.
+    """
+    return re.sub(r"[^a-z0-9ąćęłńóśźż]+", "", (value or "").lower())
+
+
+def phrase_match_variants(phrase: str) -> List[str]:
+    phrase = (phrase or "").lower().strip()
+    if not phrase:
+        return []
+
+    variants = {phrase}
+    compact = compact_match_text(phrase)
+    if compact:
+        variants.add(compact)
+
+    # Polish/market shorthand variants for generations:
+    # "2 gen" <-> "2gen" <-> "gen2"
+    m = re.fullmatch(r"(\d{1,2})\s*gen", phrase.replace(".", " ").strip())
+    if m:
+        n = m.group(1)
+        variants.update([f"{n}gen", f"gen{n}", f"gen {n}", f"{n} gen"])
+
+    m = re.fullmatch(r"gen\s*(\d{1,2})", phrase.replace(".", " ").strip())
+    if m:
+        n = m.group(1)
+        variants.update([f"gen{n}", f"{n}gen", f"gen {n}", f"{n} gen"])
+
+    # "se 2" <-> "se2"
+    m = re.fullmatch(r"se\s*(\d{1,2})", phrase.replace(".", " ").strip())
+    if m:
+        n = m.group(1)
+        variants.update([f"se{n}", f"se {n}"])
+
+    return [v for v in variants if v]
+
+
+def phrase_exists(text: str, phrase: str) -> bool:
+    text_l = (text or "").lower()
+    text_compact = compact_match_text(text_l)
+
+    for variant in phrase_match_variants(phrase):
+        if variant in text_l:
+            return True
+        variant_compact = compact_match_text(variant)
+        # Avoid compact matching for very short generic tokens like "9" or "10".
+        if len(variant_compact) >= 3 and variant_compact in text_compact:
+            return True
+    return False
+
+
 def text_contains_any(text: str, keywords: List[str]) -> Optional[str]:
     text = (text or "").lower()
     for kw in keywords:
         kw = (kw or "").lower().strip()
-        if kw and kw in text:
+        if kw and phrase_exists(text, kw):
             return kw
     return None
 
@@ -878,7 +957,8 @@ def text_contains_any(text: str, keywords: List[str]) -> Optional[str]:
 def text_contains_all_groups(text: str, groups: Any) -> Tuple[bool, str]:
     """
     groups example: [["ipad", "i pad"], ["10 gen", "10 generacji", "10th", "2022"]]
-    At least one phrase from every group must exist.
+    At least one phrase from every group must exist. Uses tolerant matching
+    for variants like SE (gen2), SE2, SE gen 2, 2gen.
     """
     text = (text or "").lower()
     if not isinstance(groups, list):
@@ -888,7 +968,7 @@ def text_contains_all_groups(text: str, groups: Any) -> Tuple[bool, str]:
         words = as_list(group)
         if not words:
             continue
-        if not any(w in text for w in words):
+        if not any(phrase_exists(text, w) for w in words):
             return False, "missing one required group: " + "/".join(words[:6])
     return True, "required groups ok"
 
@@ -1050,7 +1130,7 @@ E) Запит: ipad 10 gen do 1000
 F) Запит: apple watch se 2 do 400
 - product_category: watches
 - vinted_query: "apple watch se"
-- required_groups: [["apple watch", "watch"], ["se"], ["2 gen", "2 generacji", "2. generacji", "drugiej generacji", "2022", "2023", "se 2", "se2"]]
+- required_groups: [["apple watch", "watch"], ["se"], ["2 gen", "gen2", "gen 2", "2gen", "2 generacji", "2. generacji", "drugiej generacji", "2022", "2023", "se 2", "se2", "se gen2", "se (gen2)"]]
 - reject_any: ["sam pasek", "tylko pasek", "pasek do Apple Watch", "samo pudełko", "tylko ładowarka"]
 - quality_risk_any: ["pasek", "strap", "bransoleta", "etui", "szkło", "ładowarka", "kabel", "pudełko", "blokada", "uszkodzony", "pęknięty", "zbity", "nie działa", "kondycja baterii"]
 
@@ -1124,7 +1204,7 @@ def local_category_filter(keyword: str, max_price: Optional[float]) -> Dict[str,
             if "se" in k:
                 required.append(["se"])
                 if "2" in k or "drug" in k:
-                    required.append(["2 gen", "2 generacji", "2. generacji", "drugiej generacji", "2022", "2023", "se 2", "se2"])
+                    required.append(["2 gen", "gen2", "gen 2", "2gen", "2 generacji", "2. generacji", "drugiej generacji", "2022", "2023", "se 2", "se2", "se gen2", "se (gen2)"])
                 vinted_query = "apple watch se"
             elif "10" in k:
                 required.append(["series 10", "s10", "10"])
@@ -1168,7 +1248,7 @@ def local_category_filter(keyword: str, max_price: Optional[float]) -> Dict[str,
     if "ipad" in k and ("10" in k or "десят" in k or "gener" in k):
         required = [["ipad", "i pad"], ["10", "10 gen", "10 generacji", "10th", "2022", "10.9", "10,9"]]
     elif "apple watch" in k and "se" in k:
-        required = [["apple watch", "watch"], ["se"], ["2", "gen 2", "2 gen", "2 generacji", "2022", "2023"]]
+        required = [["apple watch", "watch"], ["se"], ["2", "gen2", "gen 2", "2gen", "2 gen", "2 generacji", "2022", "2023", "se gen2", "se (gen2)"]]
     return {
         "product_category": category,
         "vinted_query": "apple watch se" if ("apple watch" in k and "se" in k) else keyword,
@@ -1304,7 +1384,59 @@ def sanitize_ai_filter(keyword: str, data: Dict[str, Any]) -> Dict[str, Any]:
 def fallback_filter(keyword: str, max_price: Optional[float]) -> Dict[str, Any]:
     return local_category_filter(keyword, max_price)
 
+def simple_mode_filter(keyword: str, max_price: Optional[float]) -> Dict[str, Any]:
+    """Very permissive v8 filter.
+
+    It avoids model/category overfitting. Vinted query brings candidates; AI deal scoring decides.
+    This is meant for testing and for learning via feedback buttons.
+    """
+    k = (keyword or "").lower().strip()
+    category = infer_query_category(k)
+    vq = keyword.strip() if keyword else ""
+
+    # Search queries should be broad enough to catch seller wording variants.
+    if "apple watch" in k and "se" in k:
+        vq = "apple watch se"
+    elif "apple watch" in k and ("series 10" in k or "watch 10" in k or re.search(r"\b10\b", k)):
+        vq = "apple watch 10"
+    elif "apple watch" in k and ("series 9" in k or "watch 9" in k or re.search(r"\b9\b", k)):
+        vq = "apple watch 9"
+    elif "ipad" in k and re.search(r"\b10\b|10gen|10 gen|10 generacji", k):
+        vq = "ipad 10"
+    elif "ipad" in k and re.search(r"\b11\b|11gen|11 gen|11 generacji", k):
+        vq = "ipad 11"
+    elif "redmi" in k and "pad" in k:
+        vq = "redmi pad"
+
+    return {
+        "product_category": category,
+        "vinted_query": vq,
+        "filter_summary_ua": "v8 Simple Mode: фільтр максимально широкий; бот майже не блокує оферти до AI-оцінки, щоб не пропускати хороші варіанти.",
+        "required_groups": [],
+        "include_any": [],
+        "reject_any": [
+            "samo pudełko", "samo pudelko", "tylko pudełko", "tylko pudelko",
+            "sam pasek", "tylko pasek", "sama ładowarka", "sama ladowarka",
+            "tylko ładowarka", "tylko ladowarka", "samo etui", "tylko etui",
+            "samo szkło", "samo szklo", "tylko szkło", "tylko szklo",
+            "same sznurówki", "same sznurowki", "tylko sznurówki", "tylko sznurowki"
+        ],
+        "wrong_product_any": [],
+        "quality_risk_any": [
+            "pasek", "bransoleta", "ładowarka", "ladowarka", "kabel", "pudełko", "pudelko",
+            "etui", "case", "szkło", "szklo", "folia", "ryski", "ślady użytkowania",
+            "uszkodzony", "pęknięty", "pekniety", "zbity", "nie działa", "nie dziala",
+            "blokada", "icloud", "apple id", "nie paruje", "digital crown", "kondycja baterii",
+            "podróbka", "podrobka", "fake", "replika", "braki", "niekompletne"
+        ],
+        "min_ai_score": MIN_AI_SCORE_TO_SEND,
+        "message_to_seller_pl": "Cześć, czy oferta jest aktualna i czy przedmiot jest w pełni sprawny? Czy można prosić o dodatkowe zdjęcia oraz potwierdzenie modelu/stanu?"
+    }
+
 def generate_filter_with_ai(keyword: str, max_price: Optional[float]) -> Dict[str, Any]:
+    if SIMPLE_FILTER_MODE:
+        return simple_mode_filter(keyword, max_price)
+
     if not DYNAMIC_AI_FILTERS_ENABLED:
         return fallback_filter(keyword, max_price)
 
@@ -1350,6 +1482,11 @@ def passes_dynamic_ai_filter(raw: Dict[str, Any], search: Dict[str, Any]) -> Tup
     accessory_reason = accessory_only_reason(raw, profile, search.get("keyword", ""))
     if accessory_reason:
         return False, accessory_reason
+
+    if SIMPLE_FILTER_MODE:
+        # Do not block by required_groups / wrong_product_any in Simple Mode.
+        # Vinted query + price + recency decide the candidate set; AI decides quality/deal score.
+        return True, "v8 simple mode: passed to AI scoring"
 
     # Hard-reject only clear wrong products and explicit reject words.
     # Single accessory words like pasek/ładowarka/pudełko are removed from hard rejects,
@@ -1667,6 +1804,135 @@ def detect_vinted_block(response: requests.Response) -> Optional[str]:
     return None
 
 
+
+
+def compact_query(q: str) -> str:
+    q = re.sub(r"[^\w\sąćęłńóśźżĄĆĘŁŃÓŚŹŻ.-]+", " ", str(q or "").lower())
+    q = re.sub(r"\s+", " ", q).strip()
+    return q
+
+
+def build_vinted_query_variants(active_search: Dict[str, Any]) -> List[str]:
+    """
+    Build a few Vinted search_text variants.
+    Important: Vinted text search can be narrower than the app UI. If we query only
+    one exact string, good offers can be invisible to the bot before any AI filter runs.
+    """
+    base = compact_query(active_search.get("vinted_query") or active_search.get("keyword") or "")
+    original = compact_query(active_search.get("keyword") or "")
+    queries: List[str] = []
+
+    def add(q: str) -> None:
+        q = compact_query(q)
+        if q and q not in queries:
+            queries.append(q)
+
+    add(base)
+    add(original)
+
+    text = f"{base} {original}".lower()
+
+    # Apple Watch variants. Use broad query first so Vinted can return seller spelling variants.
+    if "apple" in text and "watch" in text:
+        if "se" in text:
+            add("apple watch se")
+            add("apple watch se 2")
+            add("apple watch gen 2")
+            add("apple watch")
+        elif "10" in text or "series 10" in text or "s10" in text:
+            add("apple watch series 10")
+            add("apple watch 10")
+            add("apple watch")
+        elif "9" in text or "series 9" in text or "s9" in text:
+            add("apple watch series 9")
+            add("apple watch 9")
+            add("apple watch")
+        else:
+            add("apple watch")
+
+    # iPad variants. Broad iPad catches titles like "iPad 2022 10.9 256GB".
+    if "ipad" in text or "i pad" in text:
+        if "10" in text or "2022" in text:
+            add("ipad 10")
+            add("ipad 2022")
+            add("ipad 10.9")
+            add("ipad")
+        elif "11" in text or "2025" in text or "a16" in text:
+            add("ipad 11")
+            add("ipad a16")
+            add("ipad 2025")
+            add("ipad")
+        else:
+            add("ipad")
+
+    # Redmi Pad variants.
+    if "redmi" in text and "pad" in text:
+        add("redmi pad")
+        add("redmi pad pro")
+        add("xiaomi redmi pad")
+
+    # Footwear / sneakers.
+    if "nike" in text and "dunk" in text:
+        add("nike dunk low" if "low" in text else "nike dunk")
+        add("nike dunk")
+    if "jordan" in text:
+        add("air jordan")
+        add("jordan")
+
+    # Collectibles.
+    if "funko" in text or "pop" in text:
+        add("funko pop")
+        if original and original != "funko pop":
+            add(original)
+    if "lego" in text:
+        add("lego")
+
+    # Generic broad fallback: first 2-3 meaningful words without price-like tokens.
+    tokens = [t for t in re.split(r"\s+", original or base) if t and not re.fullmatch(r"\d{2,5}", t) and t not in {"do", "zl", "zł", "pln"}]
+    if len(tokens) >= 2:
+        add(" ".join(tokens[:3]))
+        add(" ".join(tokens[:2]))
+
+    if not BROAD_SEARCH_MODE:
+        return queries[:1]
+
+    return queries[:max(1, MAX_QUERY_VARIANTS)]
+
+
+def direct_vinted_multi_request(active_search: Dict[str, Any], max_price: Optional[float]) -> Tuple[List[Dict[str, Any]], List[str]]:
+    variants = build_vinted_query_variants(active_search)
+    merged: List[Dict[str, Any]] = []
+    seen: set = set()
+    errors: List[str] = []
+
+    for q in variants:
+        try:
+            raw_items = direct_vinted_request(q, max_price)
+        except VintedFetchError as e:
+            errors.append(f"{q}: {e.kind}")
+            logger.warning("Vinted query variant failed: %s -> %s %s", q, e.kind, e.message)
+            continue
+
+        logger.info("Vinted query variant '%s' returned %s raw items", q, len(raw_items))
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            item_id = str(get_first_existing(item, ["id", "item_id", "url"], ""))
+            if not item_id:
+                title = str(get_first_existing(item, ["title", "name"], ""))
+                price = str(get_first_existing(item, ["price", "price_amount"], ""))
+                item_id = f"{title}|{price}"
+            if item_id in seen:
+                continue
+            seen.add(item_id)
+            item["_vinted_query_used"] = q
+            merged.append(item)
+
+    if not merged and errors:
+        raise VintedFetchError("all_query_variants_failed", "; ".join(errors[:8]))
+
+    return merged, variants
+
 def direct_vinted_request(keyword: str, max_price: Optional[float]) -> List[Dict[str, Any]]:
     endpoint = f"{VINTED_BASE_URL}/api/v2/catalog/items"
     params = build_vinted_params(keyword, max_price)
@@ -1799,14 +2065,19 @@ def normalize_vinted_direct_item(raw: Dict[str, Any]) -> Dict[str, Any]:
         "images": images,
         "age_minutes": age_minutes,
         "age_source": age_source,
+        "query_used": str(raw.get("_vinted_query_used", "")),
         "raw": raw,
     }
 
 
 def fetch_vinted_items(keyword: str, max_price: Optional[float], search: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     active_search = search or {"keyword": keyword, "max_price": max_price}
-    vinted_query = str(active_search.get("vinted_query") or keyword).strip() or keyword
-    raw_items = direct_vinted_request(vinted_query, max_price)
+
+    # v9: fetch multiple broad Vinted query variants.
+    # This fixes the main issue where a perfect offer exists in the app,
+    # but the exact API search_text does not return it.
+    raw_items, used_queries = direct_vinted_multi_request(active_search, max_price)
+    logger.info("Broad Vinted search variants used: %s; merged raw items=%s", used_queries, len(raw_items))
 
     filtered_recent = []
     skipped_old = 0
@@ -2306,6 +2577,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 7. Перегенерувати AI-фільтр:
 <code>/refreshfilter 3</code>
 <code>/debugsearch 3</code> — показати, чому останні raw-офери проходять або відсікаються
+
+<b>v9 Broad Search:</b> бот шукає кількома варіантами запиту, наприклад apple watch se 2 + apple watch se + apple watch, щоб не пропускати різні написання продавців.
 
 8. Тест Vinted direct:
 <code>/debug ipad</code>
