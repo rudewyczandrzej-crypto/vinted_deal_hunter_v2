@@ -563,6 +563,129 @@ def has_any(text: str, words: List[str]) -> bool:
     return any(word in text for word in words if word)
 
 
+# Accessory words are tricky on Vinted.
+# Example: "Apple Watch + pasek i ładowarka" is a good full item with accessories,
+# but "pasek do Apple Watch" is only an accessory.
+# Therefore single accessory words are NOT hard rejects anymore.
+# We hard-reject only accessory-only context in the title.
+SOFT_ACCESSORY_REJECT_TERMS = [
+    "pasek", "strap", "bransoleta", "bransoletka", "band",
+    "ładowarka", "ladowarka", "charger", "kabel", "przewód", "przewod",
+    "pudełko", "pudelko", "box",
+    "etui", "case", "cover", "pokrowiec",
+    "szkło", "szklo", "szkiełko", "szkielko", "folia",
+    "rysik", "stylus", "apple pencil", "klawiatura", "keyboard",
+    "sznurówki", "sznurowki", "wkładki", "wkladki",
+]
+
+HARD_ACCESSORY_ONLY_PHRASES = [
+    "samo pudełko", "samo pudelko", "same pudełko", "same pudelko",
+    "pudełko samo", "pudelko samo", "tylko pudełko", "tylko pudelko",
+    "sam pasek", "samy pasek", "tylko pasek", "same paski", "zestaw pasków", "zestaw paskow",
+    "sam kabel", "tylko kabel", "sama ładowarka", "sama ladowarka", "tylko ładowarka", "tylko ladowarka",
+    "samo etui", "tylko etui", "samo szkło", "samo szklo", "tylko szkło", "tylko szklo",
+    "sama folia", "tylko folia", "sama bransoleta", "tylko bransoleta",
+    "same sznurówki", "same sznurowki", "tylko sznurówki", "tylko sznurowki",
+]
+
+def remove_soft_accessory_terms(words: List[str]) -> List[str]:
+    """Do not hard-reject offers just because description says accessories are included."""
+    cleaned = []
+    soft = set(SOFT_ACCESSORY_REJECT_TERMS)
+    for word in as_list(words):
+        w = str(word).strip()
+        wl = w.lower()
+        # Keep explicit accessory-only phrases as hard rejects.
+        if wl in HARD_ACCESSORY_ONLY_PHRASES:
+            cleaned.append(w)
+            continue
+        # Move single ambiguous terms away from hard-reject logic.
+        if wl in soft:
+            continue
+        cleaned.append(w)
+    return cleaned
+
+def move_soft_accessory_rejects_to_risk(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Sanitize AI-generated filters so accessories are context risks, not blind blockers."""
+    reject = as_list(data.get("reject_any"))
+    risks = as_list(data.get("quality_risk_any"))
+    kept = []
+    moved = []
+    soft = set(SOFT_ACCESSORY_REJECT_TERMS)
+    hard = set(HARD_ACCESSORY_ONLY_PHRASES)
+
+    for word in reject:
+        w = str(word).strip()
+        wl = w.lower()
+        if wl in hard:
+            kept.append(w)
+        elif wl in soft:
+            moved.append(w)
+        else:
+            kept.append(w)
+
+    if moved:
+        data["reject_any"] = kept
+        seen = {str(x).lower() for x in risks}
+        for w in moved:
+            if w.lower() not in seen:
+                risks.append(w)
+                seen.add(w.lower())
+        data["quality_risk_any"] = risks
+    return data
+
+def accessory_only_reason(raw: Dict[str, Any], profile: Dict[str, Any], search_keyword: str) -> Optional[str]:
+    """Return reason only when title strongly looks like accessory-only offer.
+
+    This protects good listings like "Apple Watch 10 + pasek i ładowarka",
+    while still rejecting "pasek do Apple Watch" / "samo pudełko".
+    """
+    title = str(get_first_existing(raw, ["title", "name", "itemTitle", "productTitle"], "")).lower()
+    title = re.sub(r"\s+", " ", title).strip()
+    if not title:
+        return None
+
+    for phrase in HARD_ACCESSORY_ONLY_PHRASES:
+        if phrase in title:
+            return f"accessory-only phrase in title: {phrase}"
+
+    category = str(profile.get("product_category") or infer_query_category(search_keyword)).lower()
+
+    watch_terms = ["pasek", "strap", "bransoleta", "bransoletka", "band", "etui", "case", "szkło", "szklo", "folia", "ładowarka", "ladowarka", "kabel"]
+    electronics_terms = ["etui", "case", "cover", "pokrowiec", "szkło", "szklo", "folia", "ładowarka", "ladowarka", "kabel", "rysik", "stylus", "klawiatura", "keyboard"]
+    footwear_terms = ["sznurówki", "sznurowki", "wkładki", "wkladki"]
+
+    terms = []
+    product_words = []
+    if category == "watches" or "watch" in search_keyword.lower():
+        terms = watch_terms
+        product_words = ["apple watch", "watch", "zegarek"]
+    elif category == "electronics" or any(x in search_keyword.lower() for x in ["ipad", "iphone", "tablet", "redmi pad"]):
+        terms = electronics_terms
+        product_words = ["ipad", "iphone", "tablet", "redmi pad", "apple watch", "watch"]
+    elif category == "footwear":
+        terms = footwear_terms
+        product_words = ["nike", "adidas", "dunk", "jordan", "buty", "sneakers"]
+    else:
+        return None
+
+    # If the title starts with an accessory word, it is usually accessory-only.
+    for term in terms:
+        if re.search(rf"^(?:nowy|nowa|nowe|oryginalny|oryginalna|zestaw|komplet)?\s*{re.escape(term)}\b", title):
+            return f"title starts with accessory term: {term}"
+
+    # "pasek do Apple Watch", "etui do iPad", etc. are accessory-only.
+    for term in terms:
+        if re.search(rf"\b{re.escape(term)}\b.{0,40}\b(do|for)\b.{0,40}\b({'|'.join(re.escape(x) for x in product_words)})\b", title):
+            # Do not reject if title clearly starts with the product, e.g. "Apple Watch 10 + pasek do niego".
+            first_product_pos = min([title.find(x) for x in product_words if x in title] or [10**9])
+            first_term_pos = title.find(term)
+            if first_term_pos != -1 and first_term_pos < first_product_pos:
+                return f"accessory-for-product title: {term} do/for product"
+
+    return None
+
+
 def passes_product_profile_filter(raw: Dict[str, Any], search_keyword: str) -> Tuple[bool, str]:
     """
     Simpler product filter:
@@ -857,9 +980,9 @@ def build_ai_filter_prompt(keyword: str, max_price: Optional[float]) -> str:
     ["синоніми моделі/серії/версії, якщо користувач її вказав"]
   ],
   "include_any": ["додаткові корисні слова, які можуть підтвердити правильний товар"],
-  "reject_any": ["слова, які майже точно означають аксесуар/інший товар/непотрібний стан саме для цієї категорії"],
+  "reject_any": ["тільки явні фрази, які означають НЕПРАВИЛЬНИЙ товар або accessory-only оголошення, наприклад samo pudełko / tylko pasek"],
   "wrong_product_any": ["інші схожі товари або моделі, які не підходять"],
-  "quality_risk_any": ["ризикові слова саме для цієї категорії, які AI має оцінити, але не завжди блокувати"],
+  "quality_risk_any": ["ризикові або неоднозначні слова саме для цієї категорії, які AI має оцінити, але не блокувати мовчки"],
   "min_ai_score": 3,
   "message_to_seller_pl": "коротке питання продавцю польською, що перевірити перед покупкою"
 }}
@@ -880,6 +1003,8 @@ def build_ai_filter_prompt(keyword: str, max_price: Optional[float]) -> str:
 5. Не вимагай розмір взуття/одягу, якщо користувач не вказав розмір.
 6. Не вимагай чек/оригінальну коробку/гарантію, якщо користувач прямо цього не просив.
 7. Краще пропустити сумнівну оферту на AI-оцінку, ніж мовчки її заблокувати.
+8. Не додавай одиночні слова аксесуарів у reject_any, якщо вони можуть означати комплект. Наприклад для Apple Watch слова pasek/ładowarka/kabel/pudełko мають бути quality_risk_any, бо оголошення може бути "Apple Watch + pasek i ładowarka". У reject_any давай тільки accessory-only фрази: "samo pudełko", "tylko pasek", "pasek do Apple Watch", "ładowarka do Apple Watch".
+9. Те саме для інших категорій: коробка/зарядка/ремінець/шнурівки/аксесуари не мають автоматично вбивати офер, якщо головний товар теж присутній.
 
 Приклади категорій:
 
@@ -919,24 +1044,24 @@ E) Запит: ipad 10 gen do 1000
 - product_category: electronics
 - vinted_query: "ipad 10"
 - required_groups: [["ipad", "i pad"], ["10 gen", "10 generacji", "10th", "2022", "10.9", "10,9", "A2696", "A2757", "A2777"]]
-- reject_any: ["etui", "case", "szkło", "folia", "kabel", "ładowarka", "pudełko", "rysik", "klawiatura"]
-- quality_risk_any: ["icloud", "apple id", "blokada", "uszkodzony", "pęknięty", "zbity", "nie działa"]
+- reject_any: ["samo pudełko", "tylko pudełko", "etui do iPad", "szkło do iPad", "ładowarka do iPad"]
+- quality_risk_any: ["etui", "case", "szkło", "folia", "kabel", "ładowarka", "pudełko", "rysik", "klawiatura", "icloud", "apple id", "blokada", "uszkodzony", "pęknięty", "zbity", "nie działa"]
 
 F) Запит: apple watch se 2 do 400
 - product_category: watches
 - vinted_query: "apple watch se"
 - required_groups: [["apple watch", "watch"], ["se"], ["2 gen", "2 generacji", "2. generacji", "drugiej generacji", "2022", "2023", "se 2", "se2"]]
-- reject_any: ["pasek", "strap", "bransoleta", "etui", "szkło", "ładowarka", "kabel", "pudełko"]
-- quality_risk_any: ["blokada", "uszkodzony", "pęknięty", "zbity", "nie działa", "kondycja baterii"]
+- reject_any: ["sam pasek", "tylko pasek", "pasek do Apple Watch", "samo pudełko", "tylko ładowarka"]
+- quality_risk_any: ["pasek", "strap", "bransoleta", "etui", "szkło", "ładowarka", "kabel", "pudełko", "blokada", "uszkodzony", "pęknięty", "zbity", "nie działa", "kondycja baterii"]
 
 
 G) Запит: apple watch 10 do 1100
 - product_category: watches
 - vinted_query: "apple watch 10"
 - required_groups: [["apple watch", "watch"], ["series 10", "s10", "10"]]
-- reject_any: ["pasek", "strap", "bransoleta", "etui", "szkło", "folia", "ładowarka", "kabel", "pudełko samo", "samo pudełko"]
+- reject_any: ["sam pasek", "tylko pasek", "pasek do Apple Watch", "samo pudełko", "tylko pudełko", "sama ładowarka", "tylko ładowarka"]
 - wrong_product_any: ["series 8", "series 7", "series 6", "se", "ultra"]
-- quality_risk_any: ["blokada", "uszkodzony", "pęknięty", "zbity", "nie działa", "nie dziala", "digital crown", "kondycja baterii"]
+- quality_risk_any: ["pasek", "strap", "bransoleta", "etui", "szkło", "folia", "ładowarka", "kabel", "pudełko", "blokada", "uszkodzony", "pęknięty", "zbity", "nie działa", "nie dziala", "digital crown", "kondycja baterii"]
 """.strip()
 
 
@@ -960,9 +1085,9 @@ def local_category_filter(keyword: str, max_price: Optional[float]) -> Dict[str,
             "filter_summary_ua": "Шукаю конкретне взуття/кросівки, без аксесуарів, фейків і явно знищеного стану.",
             "required_groups": required,
             "include_any": ["buty", "sneakers", "rozmiar", "size"],
-            "reject_any": reject_common_market_noise + ["etui", "case", "pudełko samo", "samo pudełko"],
+            "reject_any": reject_common_market_noise + ["pudełko samo", "samo pudełko", "tylko pudełko", "same sznurówki", "same sznurowki", "tylko sznurówki", "tylko sznurowki"],
             "wrong_product_any": [],
-            "quality_risk_any": ["podróbka", "podrobka", "fake", "replika", "zniszczone", "dziura", "odklejona podeszwa", "brudne"],
+            "quality_risk_any": ["pudełko", "pudelko", "sznurówki", "sznurowki", "wkładki", "wkladki", "podróbka", "podrobka", "fake", "replika", "zniszczone", "dziura", "odklejona podeszwa", "brudne"],
             "min_ai_score": MIN_AI_SCORE_TO_SEND,
             "message_to_seller_pl": "Cześć, czy buty są oryginalne i w jakim są dokładnie stanie? Czy możesz wysłać więcej zdjęć podeszwy, metki i wnętrza?"
         }
@@ -984,7 +1109,7 @@ def local_category_filter(keyword: str, max_price: Optional[float]) -> Dict[str,
             "include_any": ["figurka", "kolekcjonerskie", "collector", "oryginalne"],
             "reject_any": reject_common_market_noise + ["koszulka", "bluza", "spodnie", "czapka", "książka", "ksiazka", "dvd", "gra"],
             "wrong_product_any": [],
-            "quality_risk_any": ["podróbka", "podrobka", "fake", "uszkodzone pudełko", "brak pudełka", "brak pudelka", "niekompletne", "braki"],
+            "quality_risk_any": ["pudełko", "pudelko", "uszkodzone pudełko", "brak pudełka", "brak pudelka", "podróbka", "podrobka", "fake", "niekompletne", "braki"],
             "min_ai_score": MIN_AI_SCORE_TO_SEND,
             "message_to_seller_pl": "Cześć, czy figurka jest oryginalna i w jakim stanie jest pudełko? Czy możesz wysłać dodatkowe zdjęcia z każdej strony?"
         }
@@ -1017,9 +1142,9 @@ def local_category_filter(keyword: str, max_price: Optional[float]) -> Dict[str,
             "filter_summary_ua": "Шукаю годинник з твого запиту, відсікаю ремінці, чохли, зарядки, коробки та явно інші моделі.",
             "required_groups": required,
             "include_any": ["koperta", "mm", "gps", "cellular", "kondycja baterii"],
-            "reject_any": reject_common_market_noise + ["pasek", "strap", "bransoleta", "etui", "case", "szkło", "szklo", "folia", "ładowarka", "ladowarka", "kabel", "pudełko samo", "samo pudełko", "samo pudelko"],
+            "reject_any": reject_common_market_noise + ["sam pasek", "tylko pasek", "samy pasek", "pasek do apple watch", "strap do apple watch", "bransoleta do apple watch", "samo pudełko", "samo pudelko", "tylko pudełko", "tylko pudelko", "sama ładowarka", "sama ladowarka", "tylko ładowarka", "tylko ladowarka"],
             "wrong_product_any": wrong,
-            "quality_risk_any": ["blokada", "icloud", "apple id", "uszkodzony", "pęknięty", "pekniety", "zbity", "nie działa", "nie dziala", "digital crown", "bateria słaba", "slaba bateria", "nie paruje"],
+            "quality_risk_any": ["pasek", "strap", "bransoleta", "bransoletka", "etui", "case", "szkło", "szklo", "folia", "ładowarka", "ladowarka", "kabel", "pudełko", "pudelko", "blokada", "icloud", "apple id", "uszkodzony", "pęknięty", "pekniety", "zbity", "nie działa", "nie dziala", "digital crown", "bateria słaba", "slaba bateria", "nie paruje"],
             "min_ai_score": MIN_AI_SCORE_TO_SEND,
             "message_to_seller_pl": "Cześć, czy zegarek jest w pełni sprawny, wylogowany z Apple ID i jaka jest kondycja baterii?"
         }
@@ -1050,9 +1175,9 @@ def local_category_filter(keyword: str, max_price: Optional[float]) -> Dict[str,
         "filter_summary_ua": "Шукаю товар з твого запиту, відсікаю явно неправильні товари та ризикові оголошення.",
         "required_groups": required,
         "include_any": [],
-        "reject_any": ["etui", "case", "cover", "pokrowiec", "szkło", "szklo", "folia", "kabel", "ładowarka", "ladowarka", "charger", "pudełko", "pudelko", "rysik", "stylus", "klawiatura", "uchwyt", "stojak"],
+        "reject_any": ["samo pudełko", "samo pudelko", "tylko pudełko", "tylko pudelko", "etui do", "case do", "szkło do", "szklo do", "folia do", "ładowarka do", "ladowarka do"],
         "wrong_product_any": [],
-        "quality_risk_any": ["uszkodzony", "pęknięty", "zbity", "icloud", "blokada", "nie działa"],
+        "quality_risk_any": ["etui", "case", "cover", "pokrowiec", "szkło", "szklo", "folia", "kabel", "ładowarka", "ladowarka", "charger", "pudełko", "pudelko", "rysik", "stylus", "klawiatura", "uchwyt", "stojak", "uszkodzony", "pęknięty", "zbity", "icloud", "blokada", "nie działa"],
         "min_ai_score": MIN_AI_SCORE_TO_SEND,
         "message_to_seller_pl": "Dzień dobry, czy oferta jest aktualna? Czy przedmiot jest w pełni sprawny i czy można prosić o dodatkowe zdjęcia?"
     }
@@ -1165,7 +1290,9 @@ def sanitize_ai_filter(keyword: str, data: Dict[str, Any]) -> Dict[str, Any]:
     data.setdefault("message_to_seller_pl", "Cześć, czy oferta jest aktualna? Czy możesz wysłać więcej informacji i zdjęć?")
 
     data = move_minor_wear_from_reject_to_risk(data)
+    data = move_soft_accessory_rejects_to_risk(data)
     data = force_local_category_consistency(keyword, data)
+    data = move_soft_accessory_rejects_to_risk(data)
 
     # Final safety: if AI produced empty required groups, use local fallback groups.
     if not as_list(data.get("required_groups")):
@@ -1220,9 +1347,14 @@ def passes_dynamic_ai_filter(raw: Dict[str, Any], search: Dict[str, Any]) -> Tup
     title = str(get_first_existing(raw, ["title", "name", "itemTitle", "productTitle"], "")).lower()
     combined = f"{title} | {text}".lower()
 
+    accessory_reason = accessory_only_reason(raw, profile, search.get("keyword", ""))
+    if accessory_reason:
+        return False, accessory_reason
+
     # Hard-reject only clear wrong products and explicit reject words.
-    # quality_risk_any is NOT hard-rejected here; AI evaluates it later, so we do not miss cheap items with small scratches.
-    reject_words = as_list(profile.get("reject_any")) + as_list(profile.get("wrong_product_any"))
+    # Single accessory words like pasek/ładowarka/pudełko are removed from hard rejects,
+    # because they may simply mean accessories are included with the main item.
+    reject_words = remove_soft_accessory_terms(as_list(profile.get("reject_any"))) + as_list(profile.get("wrong_product_any"))
     bad = text_contains_any(combined, reject_words)
     if bad:
         return False, f"AI DB filter rejected keyword: {bad}"
