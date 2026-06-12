@@ -419,3 +419,106 @@ MIN_DEAL_SCORE_TO_SEND=6
 ```
 
 Тоді бот буде присилати тільки більш вигідні оферти.
+Vinted AI Deal Hunter v4 — Catch More Offers
+Це чиста збірка тільки Vinted-агента. Версія v4 зроблена так, щоб бот менше пропускав хороші офери і не був заточений тільки під техніку.
+Що є
+Telegram-бот для Vinted.
+`/add ipad 10gen до 1000` — ти пишеш людський запит.
+AI сам створює `filter_json` і зберігає його в Supabase.
+Підтримка різних категорій: техніка, Apple Watch, кросівки, одяг, Funko Pop, LEGO, фігурки, книги, сумки, косметика, домашні речі тощо.
+Deal score для кожної оферти.
+Кнопки фідбеку: 👍 Хороша, 👎 Погана, 🚫 Не той товар, 💸 Не вигідно, ⚠️ Підозріло.
+Навчання фільтра після фідбеку.
+`/debugsearch ID` — показує, чи бот бачить raw-офери з Vinted і чому вони проходять або відсікаються.
+Що змінено у v4
+Попередня версія могла нічого не скидати, бо була занадто обережна. У v4:
+`ONLY_RECENT_MINUTES=60` замість короткого вікна 5–10 хв.
+`MAX_ITEMS_PER_SEARCH=50`, щоб бот бачив більше raw-оголошень.
+`MIN_AI_SCORE_TO_SEND=3`, щоб сумнівні, але потенційно вигідні офери не зникали мовчки.
+`ryski`, `ślady użytkowania`, `drobne ślady`, `bez pudełka` не блокують офер одразу. Вони йдуть у ризики, а AI оцінює їх у повідомленні.
+Жорстко відсікаються тільки очевидно неправильні речі: аксесуари замість товару, інші моделі, явні блокування/поломки, якщо AI-фільтр так вирішив.
+Файли
+`main.py` — основний бот.
+`supabase.sql` — створює/оновлює таблиці в Supabase.
+`.env.example` — приклад змінних середовища.
+`requirements.txt` — бібліотеки.
+`Procfile` — для Railway.
+`runtime.txt` — версія Python.
+Швидкий старт
+Створи новий GitHub repo.
+Закинь усі файли з цієї папки.
+У Supabase відкрий SQL Editor.
+Встав весь текст із `supabase.sql` і натисни `Run`.
+У Railway додай змінні з `.env.example`.
+Запусти deploy.
+Команди Telegram
+```text
+/start
+/help
+/add ipad 10gen до 1000
+/add apple watch se 2 до 400
+/add nike dunk low до 150
+/add funko pop harry potter до 60
+/list
+/filter ID
+/refreshfilter ID
+/debugsearch ID
+/check
+/delete ID
+/clear
+```
+Як працює Supabase SQL Editor
+SQL Editor — це не папка з файлами для бота. Коли ти вставляєш туди `supabase.sql` і натискаєш `Run`, Supabase виконує команди:
+створює таблиці, якщо їх ще нема;
+додає нові колонки, якщо їх ще нема;
+створює індекси;
+оновлює структуру бази.
+Після цього бот не читає файл `supabase.sql`. Бот працює з реальними таблицями в базі через `SUPABASE_URL` і `SUPABASE_KEY`.
+Тобто якщо в SQL Editor видно старі запити або старі файли — це не значить, що бот їх читає. Це просто історія або вкладки редактора. Важливі тільки таблиці в розділі Table Editor.
+Основні таблиці:
+`searches` — твої активні пошуки і AI-фільтри.
+`sent_items` — що бот уже скидав, щоб не дублювати.
+`offer_feedback` — твій фідбек по оферах.
+`filter_learning_logs` — історія автооновлень фільтра.
+Чистий старт у Supabase
+Якщо хочеш очистити старі пошуки і sent history, після запуску `supabase.sql` можеш виконати:
+```sql
+truncate table filter_learning_logs restart identity cascade;
+truncate table offer_feedback restart identity cascade;
+truncate table sent_items restart identity cascade;
+truncate table searches restart identity cascade;
+```
+Це видалить старі пошуки, старі офери і старий фідбек. Структура таблиць залишиться.
+Важливі env-змінні
+```env
+ONLY_RECENT_MINUTES=60
+MAX_ITEMS_PER_SEARCH=50
+MIN_AI_SCORE_TO_SEND=3
+MIN_DEAL_SCORE_TO_SEND=0
+SKIP_UNKNOWN_AGE=false
+REJECT_BAD_CONDITIONS=false
+SOFTEN_MINOR_WEAR_WORDS=true
+```
+Якщо бот буде слати занадто багато сміття, можна зробити суворіше:
+```env
+MIN_AI_SCORE_TO_SEND=4
+ONLY_RECENT_MINUTES=30
+```
+Якщо бот все ще пропускає офери, можна зробити ширше:
+```env
+ONLY_RECENT_MINUTES=120
+MAX_ITEMS_PER_SEARCH=80
+MIN_AI_SCORE_TO_SEND=3
+```
+Як перевірити, чому офер не прийшов
+В Telegram:
+```text
+/debugsearch 21
+```
+Бот покаже перші raw-офери з Vinted і причину:
+старіше ніж `ONLY_RECENT_MINUTES`;
+пройде на AI;
+відсіяно product filter;
+відсіяно quality filter;
+Vinted повернув 0 raw items.
+Це потрібно саме для шліфування, щоб не гадати, бот не побачив офер чи сам його відкинув.
