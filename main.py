@@ -44,15 +44,34 @@ EMPTY_ALERT_THRESHOLD_CYCLES = int(os.getenv("EMPTY_ALERT_THRESHOLD_CYCLES", "3"
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant").strip()
 
-BOT_VERSION = "v11_price_parse_fix_2026_06_12"
-CATCH_ALL_MODE = os.getenv("CATCH_ALL_MODE", "true").lower() in ["1", "true", "yes", "y"]
-MIN_EFFECTIVE_RECENT_MINUTES = int(os.getenv("MIN_EFFECTIVE_RECENT_MINUTES", "360"))
+BOT_VERSION = "v13_stable_antispam_no_autolearn_2026_06_12"
+
+# v13 Stable Anti-Spam Mode:
+# Previous catch-all patches were useful for debugging, but they could spam many old/weak offers.
+# Stable mode keeps broad search, but caps freshness/items and requires stronger AI + deal scores.
+STABLE_SEND_MODE = os.getenv("STABLE_SEND_MODE", "true").lower() in ["1", "true", "yes", "y"]
+CATCH_ALL_MODE = os.getenv("CATCH_ALL_MODE", "false").lower() in ["1", "true", "yes", "y"]
+
+# In stable mode, old Railway variables like ONLY_RECENT_MINUTES=360 are capped.
+MIN_EFFECTIVE_RECENT_MINUTES = int(os.getenv("MIN_EFFECTIVE_RECENT_MINUTES", "30"))
+MAX_EFFECTIVE_RECENT_MINUTES = int(os.getenv("MAX_EFFECTIVE_RECENT_MINUTES", "120"))
 
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "300"))
-MAX_ITEMS_PER_SEARCH = int(os.getenv("MAX_ITEMS_PER_SEARCH", "50"))
-MIN_AI_SCORE_TO_SEND = int(os.getenv("MIN_AI_SCORE_TO_SEND", "2"))
-MIN_DEAL_SCORE_TO_SEND = int(os.getenv("MIN_DEAL_SCORE_TO_SEND", "0"))
-FEEDBACK_LEARNING_ENABLED = os.getenv("FEEDBACK_LEARNING_ENABLED", "true").lower() in ["1", "true", "yes", "y"]
+
+MAX_ITEMS_PER_SEARCH_RAW = int(os.getenv("MAX_ITEMS_PER_SEARCH", "30"))
+MAX_EFFECTIVE_ITEMS_PER_SEARCH = int(os.getenv("MAX_EFFECTIVE_ITEMS_PER_SEARCH", "30"))
+MAX_ITEMS_PER_SEARCH = min(MAX_ITEMS_PER_SEARCH_RAW, MAX_EFFECTIVE_ITEMS_PER_SEARCH) if STABLE_SEND_MODE else MAX_ITEMS_PER_SEARCH_RAW
+
+MIN_AI_SCORE_TO_SEND_RAW = int(os.getenv("MIN_AI_SCORE_TO_SEND", "5"))
+MIN_EFFECTIVE_AI_SCORE = int(os.getenv("MIN_EFFECTIVE_AI_SCORE", "5"))
+MIN_AI_SCORE_TO_SEND = max(MIN_AI_SCORE_TO_SEND_RAW, MIN_EFFECTIVE_AI_SCORE) if STABLE_SEND_MODE else MIN_AI_SCORE_TO_SEND_RAW
+
+MIN_DEAL_SCORE_TO_SEND_RAW = int(os.getenv("MIN_DEAL_SCORE_TO_SEND", "6"))
+MIN_EFFECTIVE_DEAL_SCORE = int(os.getenv("MIN_EFFECTIVE_DEAL_SCORE", "6"))
+MIN_DEAL_SCORE_TO_SEND = max(MIN_DEAL_SCORE_TO_SEND_RAW, MIN_EFFECTIVE_DEAL_SCORE) if STABLE_SEND_MODE else MIN_DEAL_SCORE_TO_SEND_RAW
+
+# Feedback is saved, but v13 does NOT auto-edit filter_json. Auto-learning was too unstable/noisy.
+FEEDBACK_LEARNING_ENABLED = os.getenv("FEEDBACK_LEARNING_ENABLED", "false").lower() in ["1", "true", "yes", "y"]
 FEEDBACK_TYPES = {
     "good": "👍 Хороша",
     "bad": "👎 Погана",
@@ -76,18 +95,27 @@ SIMPLE_FILTER_MODE = os.getenv("SIMPLE_FILTER_MODE", "true").lower() in ["1", "t
 # "apple watch se 2" may not catch "Apple Watch SE (gen 2)".
 # This mode queries a few broad variants and lets AI/deal score decide.
 BROAD_SEARCH_MODE = os.getenv("BROAD_SEARCH_MODE", "true").lower() in ["1", "true", "yes", "y"]
-MAX_QUERY_VARIANTS = int(os.getenv("MAX_QUERY_VARIANTS", "5"))
+MAX_QUERY_VARIANTS_RAW = int(os.getenv("MAX_QUERY_VARIANTS", "3"))
+MAX_EFFECTIVE_QUERY_VARIANTS = int(os.getenv("MAX_EFFECTIVE_QUERY_VARIANTS", "3"))
+MAX_QUERY_VARIANTS = min(MAX_QUERY_VARIANTS_RAW, MAX_EFFECTIVE_QUERY_VARIANTS) if STABLE_SEND_MODE else MAX_QUERY_VARIANTS_RAW
 
 
 # Freshness filter. In catch-all mode, old Railway variables like ONLY_RECENT_MINUTES=60
 # are not allowed to make the bot too narrow again.
-ONLY_RECENT_MINUTES_RAW = int(os.getenv("ONLY_RECENT_MINUTES", "360"))
-ONLY_RECENT_MINUTES = max(ONLY_RECENT_MINUTES_RAW, MIN_EFFECTIVE_RECENT_MINUTES) if CATCH_ALL_MODE else ONLY_RECENT_MINUTES_RAW
+ONLY_RECENT_MINUTES_RAW = int(os.getenv("ONLY_RECENT_MINUTES", "120"))
+if STABLE_SEND_MODE:
+    ONLY_RECENT_MINUTES = max(MIN_EFFECTIVE_RECENT_MINUTES, min(ONLY_RECENT_MINUTES_RAW, MAX_EFFECTIVE_RECENT_MINUTES))
+elif CATCH_ALL_MODE:
+    ONLY_RECENT_MINUTES = max(ONLY_RECENT_MINUTES_RAW, MIN_EFFECTIVE_RECENT_MINUTES)
+else:
+    ONLY_RECENT_MINUTES = ONLY_RECENT_MINUTES_RAW
 
 # If Apify does not return age/date:
 # true  = skip item, safer, avoids old listings
 # false = allow item, may send old listings
-SKIP_UNKNOWN_AGE = os.getenv("SKIP_UNKNOWN_AGE", "false").lower() in ["1", "true", "yes", "y"]
+SKIP_UNKNOWN_AGE_RAW = os.getenv("SKIP_UNKNOWN_AGE", "true").lower() in ["1", "true", "yes", "y"]
+# In stable mode, unknown-age listings are skipped to avoid old-offer spam.
+SKIP_UNKNOWN_AGE = True if STABLE_SEND_MODE else SKIP_UNKNOWN_AGE_RAW
 
 # Optional hard quality filter.
 # Default is false in v3 because the bot should work for electronics, shoes, clothes, collectibles, toys, etc.
@@ -2179,19 +2207,50 @@ def fetch_vinted_items(keyword: str, max_price: Optional[float], search: Optiona
 # =========================
 
 def safe_json_loads(text: str) -> Dict[str, Any]:
-    text = text.strip()
+    """Parse JSON returned by Groq as safely as possible.
+
+    Groq sometimes returns valid JSON plus extra text, or even two JSON objects.
+    Old parser used text[first { : last }], which can raise:
+    "Extra data: line ..." when there is anything after the first JSON object.
+    This parser uses JSONDecoder.raw_decode so it can take the first valid object
+    and ignore trailing explanations/extra objects.
+    """
+    text = (text or "").strip()
 
     if text.startswith("```"):
         text = text.replace("```json", "").replace("```", "").strip()
 
+    # 1) Perfect JSON.
     try:
-        return json.loads(text)
+        data = json.loads(text)
+        if isinstance(data, dict):
+            return data
+        raise ValueError("JSON is not an object")
     except Exception:
-        start = text.find("{")
-        end = text.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            return json.loads(text[start:end + 1])
-        raise
+        pass
+
+    decoder = json.JSONDecoder()
+
+    # 2) JSON object with trailing text / extra JSON objects.
+    # Try from every opening brace until one valid object is decoded.
+    for match in re.finditer(r"\{", text):
+        candidate = text[match.start():].strip()
+        try:
+            data, _ = decoder.raw_decode(candidate)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            continue
+
+    # 3) Last fallback: old behavior, but only if it is valid.
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        data = json.loads(text[start:end + 1])
+        if isinstance(data, dict):
+            return data
+
+    raise ValueError("Could not parse JSON object from AI response")
 
 
 def evaluate_item_with_ai(item: Dict[str, Any], search: Dict[str, Any]) -> Dict[str, Any]:
@@ -2808,19 +2867,20 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     text = f"""🩺 <b>Vinted bot status</b>
 Версія: <code>{escape(BOT_VERSION)}</code>
+STABLE_SEND_MODE: <code>{STABLE_SEND_MODE}</code>
 CATCH_ALL_MODE: <code>{CATCH_ALL_MODE}</code>
 SIMPLE_FILTER_MODE: <code>{SIMPLE_FILTER_MODE}</code>
 BROAD_SEARCH_MODE: <code>{BROAD_SEARCH_MODE}</code>
-MAX_QUERY_VARIANTS: <code>{MAX_QUERY_VARIANTS}</code>
-ONLY_RECENT_MINUTES raw Railway: <code>{ONLY_RECENT_MINUTES_RAW}</code>
-ONLY_RECENT_MINUTES effective: <code>{ONLY_RECENT_MINUTES}</code>
-MIN_AI_SCORE_TO_SEND: <code>{MIN_AI_SCORE_TO_SEND}</code>
-MIN_DEAL_SCORE_TO_SEND: <code>{MIN_DEAL_SCORE_TO_SEND}</code>
-MAX_ITEMS_PER_SEARCH: <code>{MAX_ITEMS_PER_SEARCH}</code>
-SKIP_UNKNOWN_AGE: <code>{SKIP_UNKNOWN_AGE}</code>
+MAX_QUERY_VARIANTS raw/effective: <code>{MAX_QUERY_VARIANTS_RAW}/{MAX_QUERY_VARIANTS}</code>
+ONLY_RECENT_MINUTES raw/effective: <code>{ONLY_RECENT_MINUTES_RAW}/{ONLY_RECENT_MINUTES}</code>
+MIN_AI_SCORE_TO_SEND raw/effective: <code>{MIN_AI_SCORE_TO_SEND_RAW}/{MIN_AI_SCORE_TO_SEND}</code>
+MIN_DEAL_SCORE_TO_SEND raw/effective: <code>{MIN_DEAL_SCORE_TO_SEND_RAW}/{MIN_DEAL_SCORE_TO_SEND}</code>
+MAX_ITEMS_PER_SEARCH raw/effective: <code>{MAX_ITEMS_PER_SEARCH_RAW}/{MAX_ITEMS_PER_SEARCH}</code>
+SKIP_UNKNOWN_AGE raw/effective: <code>{SKIP_UNKNOWN_AGE_RAW}/{SKIP_UNKNOWN_AGE}</code>
+FEEDBACK_LEARNING_ENABLED: <code>{FEEDBACK_LEARNING_ENABLED}</code>
 REJECT_BAD_CONDITIONS: <code>{REJECT_BAD_CONDITIONS}</code>
 
-Якщо raw=60, але effective=360 — це нормально: v10 перекрив стару Railway-змінну, щоб бот не пропускав офери.
+v13 Stable Mode: фідбек зберігається, але filter_json більше не автооновлюється. Бот відсікає спам через свіжість + AI score + deal score.
 """
     await message.reply_text(text.strip(), parse_mode=ParseMode.HTML)
 
@@ -3081,7 +3141,7 @@ def learn_from_feedback(telegram_id: str, sent_item_id: int, feedback_type: str)
     save_offer_feedback(telegram_id, search_id, sent_item_id, feedback_type)
 
     if not FEEDBACK_LEARNING_ENABLED:
-        return "Фідбек збережено, але автонавчання вимкнене через FEEDBACK_LEARNING_ENABLED=false."
+        return "Фідбек збережено. Автооновлення filter_json вимкнене у stable mode, щоб бот не ламав фільтри; кнопки поки збирають історію фідбеку."
 
     if feedback_type == "good":
         return "Фідбек збережено. Фільтр не звужував, бо оферта хороша."
