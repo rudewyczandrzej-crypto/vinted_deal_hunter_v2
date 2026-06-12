@@ -44,7 +44,7 @@ EMPTY_ALERT_THRESHOLD_CYCLES = int(os.getenv("EMPTY_ALERT_THRESHOLD_CYCLES", "3"
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant").strip()
 
-BOT_VERSION = "v14_ai_judge_mode_2026_06_12"
+BOT_VERSION = "v15_ai_judge_exact_model_guard_2026_06_12"
 
 # v13 Stable Anti-Spam Mode:
 # Previous catch-all patches were useful for debugging, but they could spam many old/weak offers.
@@ -1537,6 +1537,70 @@ def generate_filter_with_ai(keyword: str, max_price: Optional[float]) -> Dict[st
         return fallback_filter(keyword, max_price)
 
 
+
+def explicit_model_mismatch_reason(raw: Dict[str, Any], search: Dict[str, Any]) -> Optional[str]:
+    """Cheap safety guard before AI Judge.
+
+    AI should make the final semantic decision, but obvious same-brand/different-model
+    mistakes waste tokens and create spam. This guard blocks only clear model-family
+    mismatches like: query "Amazfit Balance 2" vs title "Amazfit GTS 2 mini".
+    It does not replace AI Judge; it only prevents obvious wrong lines.
+    """
+    keyword = str(search.get("keyword") or "").lower()
+    title = str(get_first_existing(raw, ["title", "name", "itemTitle", "productTitle"], "")).lower()
+    text = item_searchable_text(raw).lower()
+    combined = f"{title} | {text}"
+    compact = compact_match_text(combined)
+    kw_compact = compact_match_text(keyword)
+
+    def has(pattern: str) -> bool:
+        return re.search(pattern, combined, flags=re.IGNORECASE) is not None
+
+    # Amazfit: Balance 2 is a different line than GTS/GTR/Bip/Active/T-Rex.
+    if "amazfit" in keyword and "balance" in keyword:
+        other_amazfit_lines = [
+            r"\bgts\s*\d*\b", r"\bgtr\s*\d*\b", r"\bbip\b", r"\bactive\b",
+            r"\bt[\s-]?rex\b", r"\btrex\b", r"\bcheetah\b", r"\bfalcon\b",
+            r"\bband\b", r"\bneo\b",
+        ]
+        for pat in other_amazfit_lines:
+            if has(pat):
+                return "wrong Amazfit model line for Balance search"
+        if "balance" not in combined:
+            return "missing Balance model keyword for Amazfit Balance search"
+        if re.search(r"\bbalance\s*2\b|balance2", keyword):
+            if not re.search(r"\bbalance\s*2\b|balance2", combined):
+                return "Amazfit Balance listing is not clearly Balance 2"
+
+    # Apple Watch exact families.
+    if "apple" in keyword and "watch" in keyword:
+        if "se" in keyword and ("2" in kw_compact or "gen2" in kw_compact or "generacji" in keyword):
+            if has(r"\bseries\s*(?:1|2|3|4|5|6|7|8|9|10|11)\b") or has(r"\bultra\b"):
+                return "wrong Apple Watch line for SE 2 search"
+        if re.search(r"\b(?:series\s*)?10\b|\bs10\b", keyword) and "se" not in keyword:
+            if has(r"\bse\b") or has(r"\bultra\b") or has(r"\bseries\s*(?:1|2|3|4|5|6|7|8|9)\b"):
+                return "wrong Apple Watch model for Series 10 search"
+        if re.search(r"\b(?:series\s*)?9\b|\bs9\b", keyword) and "se" not in keyword:
+            if has(r"\bse\b") or has(r"\bultra\b") or has(r"\bseries\s*(?:1|2|3|4|5|6|7|8|10|11)\b"):
+                return "wrong Apple Watch model for Series 9 search"
+
+    # iPad A16 / iPad 11th generation should not be old iPads.
+    if "ipad" in keyword and ("a16" in keyword or "2025" in keyword or re.search(r"\b11\b", keyword)):
+        if has(r"\bipad\s*(?:9|10)\b") or has(r"\b2021\b|\b2022\b") or has(r"\bmini\b|\bair\b|\bpro\b"):
+            return "wrong iPad model for iPad A16/11 search"
+
+    # Sneakers exact families.
+    if "nike" in keyword and "dunk" in keyword and "low" in keyword:
+        if has(r"\bdunk\s*high\b") or has(r"\bair\s*force\b") or has(r"\bjordan\b"):
+            return "wrong sneaker model for Nike Dunk Low search"
+
+    # Funko Pop should not become clothes/books/posters/keychains.
+    if "funko" in keyword or re.search(r"\bpop\b", keyword):
+        if has(r"\bkoszulka\b|\bbluza\b|\bplakat\b|\bnaklejka\b|\bbrelok\b|\bksiążka\b|\bksiazka\b|\bdvd\b"):
+            return "wrong collectible type for Funko Pop search"
+
+    return None
+
 def passes_dynamic_ai_filter(raw: Dict[str, Any], search: Dict[str, Any]) -> Tuple[bool, str]:
     profile = get_filter_profile(search)
     keyword = search.get("keyword", "")
@@ -1551,6 +1615,9 @@ def passes_dynamic_ai_filter(raw: Dict[str, Any], search: Dict[str, Any]) -> Tup
         accessory_reason = accessory_only_reason(raw, profile, keyword)
         if accessory_reason:
             return False, f"AI Judge prefilter: {accessory_reason}"
+        mismatch_reason = explicit_model_mismatch_reason(raw, search)
+        if mismatch_reason:
+            return False, f"AI Judge exact model guard: {mismatch_reason}"
         return True, "AI Judge Mode: product decision delegated to AI"
 
     if not profile:
@@ -2299,6 +2366,11 @@ def evaluate_item_with_ai(item: Dict[str, Any], search: Dict[str, Any]) -> Dict[
 - Якщо продавець пише "Apple Watch SE (gen2)", "SE gen2", "SE2", "2 generacji" — це підходить для Apple Watch SE 2.
 - Якщо користувач шукає Apple Watch Series 10, то SE / Series 9 / Ultra — не той товар.
 - Якщо користувач шукає iPad A16 / iPad 11 / iPad 2025, старі iPad 9/10/mini/pro можуть бути не тим товаром, якщо явно не збігаються.
+- Якщо користувач шукає Amazfit Balance 2, то Amazfit GTS 2 mini / GTS / GTR / Bip / Active / T-Rex — НЕ той товар. Та сама марка або цифра 2 не означає збіг моделі.
+- Якщо користувач вказав конкретну модель/серію, пріоритет №1 — ТОЧНА модель, а не просто бренд, категорія або схожа цифра.
+- Приклад: запит "amazfit balance 2" і оголошення "Smartwatch Amazfit GTS 2 mini" => is_target_product=false, target_confidence=1-2, should_send=false.
+- Приклад: запит "apple watch se 2" і оголошення "Apple Watch Series 2/Series 8/Ultra" => is_target_product=false.
+- Приклад: запит "nike dunk low" і оголошення "Dunk High" або "Air Force" => is_target_product=false.
 - Якщо користувач шукає Funko Pop, не плутай з футболкою, плакатом, книгою чи брелком.
 - Якщо користувач шукає Nike Dunk Low, не плутай з Dunk High, Jordan, Air Force або аксесуарами.
 - Дрібні ryski/ślady użytkowania — це ризик, але не завжди причина не слати, якщо ціна добра.
@@ -2955,6 +3027,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 Версія: <code>{escape(BOT_VERSION)}</code>
 STABLE_SEND_MODE: <code>{STABLE_SEND_MODE}</code>
 AI_JUDGE_MODE: <code>{AI_JUDGE_MODE}</code>
+EXACT_MODEL_GUARD: <code>True</code>
 MIN_TARGET_CONFIDENCE: <code>{MIN_TARGET_CONFIDENCE}</code>
 CATCH_ALL_MODE: <code>{CATCH_ALL_MODE}</code>
 SIMPLE_FILTER_MODE: <code>{SIMPLE_FILTER_MODE}</code>
