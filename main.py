@@ -41,10 +41,16 @@ VINTED_CURRENCY = os.getenv("VINTED_CURRENCY", "PLN").strip()
 # Alert if direct Vinted API returns empty raw results for all searches this many cycles in a row.
 EMPTY_ALERT_THRESHOLD_CYCLES = int(os.getenv("EMPTY_ALERT_THRESHOLD_CYCLES", "3"))
 
+# v16: Vinted sometimes blocks Railway/datacenter IPs with 403/429/captcha.
+# Do not spam Telegram with the same health alert every cycle; enter cooldown instead.
+VINTED_BLOCK_COOLDOWN_SECONDS = int(os.getenv("VINTED_BLOCK_COOLDOWN_SECONDS", "3600"))
+HEALTH_ALERT_COOLDOWN_SECONDS = int(os.getenv("HEALTH_ALERT_COOLDOWN_SECONDS", "7200"))
+SEND_HEALTH_ALERTS = os.getenv("SEND_HEALTH_ALERTS", "true").lower() in ["1", "true", "yes", "y"]
+
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant").strip()
 
-BOT_VERSION = "v15_ai_judge_exact_model_guard_2026_06_12"
+BOT_VERSION = "v16_vinted_block_cooldown_2026_06_12"
 
 # v13 Stable Anti-Spam Mode:
 # Previous catch-all patches were useful for debugging, but they could spam many old/weak offers.
@@ -269,7 +275,8 @@ vinted_session.headers.update({
 
 EMPTY_ALL_SEARCHES_CYCLES = 0
 LAST_HEALTH_ALERT_TS = 0.0
-HEALTH_ALERT_COOLDOWN_SECONDS = 1800
+VINTED_BLOCKED_UNTIL_TS = 0.0
+LAST_VINTED_BLOCK_REASON = ""
 
 
 # =========================
@@ -2048,17 +2055,43 @@ def build_vinted_query_variants(active_search: Dict[str, Any]) -> List[str]:
     return queries[:max(1, MAX_QUERY_VARIANTS)]
 
 
+def is_vinted_block_error(kind: str, message: str = "") -> bool:
+    text = f"{kind} {message}".lower()
+    return any(x in text for x in ["blocked", "http 403", "http 429", "captcha", "cloudflare", "forbidden", "access denied"])
+
+
+def set_vinted_block_cooldown(reason: str) -> None:
+    global VINTED_BLOCKED_UNTIL_TS, LAST_VINTED_BLOCK_REASON
+    VINTED_BLOCKED_UNTIL_TS = max(VINTED_BLOCKED_UNTIL_TS, time.time() + VINTED_BLOCK_COOLDOWN_SECONDS)
+    LAST_VINTED_BLOCK_REASON = reason
+    logger.warning("Vinted block cooldown active for %s seconds. Reason: %s", VINTED_BLOCK_COOLDOWN_SECONDS, reason)
+
+
+def get_vinted_cooldown_remaining_seconds() -> int:
+    return max(0, int(VINTED_BLOCKED_UNTIL_TS - time.time()))
+
+
 def direct_vinted_multi_request(active_search: Dict[str, Any], max_price: Optional[float]) -> Tuple[List[Dict[str, Any]], List[str]]:
+    cooldown_left = get_vinted_cooldown_remaining_seconds()
+    if cooldown_left > 0:
+        raise VintedFetchError(
+            "vinted_cooldown",
+            f"Vinted direct API is in cooldown for ~{cooldown_left // 60 + 1} min after block. Last reason: {LAST_VINTED_BLOCK_REASON}"
+        )
+
     variants = build_vinted_query_variants(active_search)
     merged: List[Dict[str, Any]] = []
     seen: set = set()
     errors: List[str] = []
+    block_errors = 0
 
     for q in variants:
         try:
             raw_items = direct_vinted_request(q, max_price)
         except VintedFetchError as e:
             errors.append(f"{q}: {e.kind}")
+            if is_vinted_block_error(e.kind, e.message):
+                block_errors += 1
             logger.warning("Vinted query variant failed: %s -> %s %s", q, e.kind, e.message)
             continue
 
@@ -2078,7 +2111,11 @@ def direct_vinted_multi_request(active_search: Dict[str, Any], max_price: Option
             merged.append(item)
 
     if not merged and errors:
-        raise VintedFetchError("all_query_variants_failed", "; ".join(errors[:8]))
+        details = "; ".join(errors[:8])
+        if block_errors and block_errors == len(errors):
+            set_vinted_block_cooldown(details)
+            raise VintedFetchError("vinted_blocked_cooldown", f"All Vinted query variants look blocked. Cooldown started. {details}")
+        raise VintedFetchError("all_query_variants_failed", details)
 
     return merged, variants
 
@@ -2098,9 +2135,11 @@ def direct_vinted_request(keyword: str, max_price: Optional[float]) -> List[Dict
         response = vinted_session.get(endpoint, params=params, timeout=30)
         block_reason = detect_vinted_block(response)
         if block_reason:
+            msg = f"Vinted direct API blocked request ({block_reason}). Status={response.status_code}"
+            set_vinted_block_cooldown(msg)
             raise VintedFetchError(
                 "blocked",
-                f"Vinted direct API blocked request ({block_reason}). Status={response.status_code}"
+                msg
             )
 
     if response.status_code >= 500:
@@ -2684,8 +2723,13 @@ async def send_health_alert(application: Application, telegram_id: str, title: s
     """
     global LAST_HEALTH_ALERT_TS
 
+    if not SEND_HEALTH_ALERTS:
+        logger.info("Health alert suppressed because SEND_HEALTH_ALERTS=false: %s %s", title, details)
+        return
+
     now = time.time()
     if now - LAST_HEALTH_ALERT_TS < HEALTH_ALERT_COOLDOWN_SECONDS:
+        logger.info("Health alert suppressed by cooldown: %s", title)
         return
 
     LAST_HEALTH_ALERT_TS = now
@@ -2698,6 +2742,7 @@ async def send_health_alert(application: Application, telegram_id: str, title: s
 {escape(details)}
 
 Ймовірно, треба втрутитись: Vinted міг дати 403/captcha, змінити API або повертати порожні результати.
+Якщо це 403/blocked, бот сам робить cooldown і не буде спамити алертами.
 """
 
     try:
@@ -2741,12 +2786,16 @@ async def scheduled_check(context: ContextTypes.DEFAULT_TYPE) -> None:
         except VintedFetchError as e:
             had_vinted_error = True
             logger.error("Vinted health error during scheduled check: %s %s", e.kind, e.message)
+            # v16: do not spam Telegram on every search/cycle when Vinted blocks direct API.
             await send_health_alert(
                 application,
                 alert_telegram_id,
                 f"Vinted direct error: {e.kind}",
                 e.message,
             )
+            if e.kind in ["blocked", "vinted_blocked_cooldown"]:
+                logger.warning("Stopping this scheduled cycle because Vinted cooldown/block is active.")
+                break
         except Exception as e:
             had_vinted_error = True
             logger.error("Unexpected scheduled check error: %s", e)
@@ -3411,7 +3460,7 @@ def main() -> None:
     )
 
     init_vinted_session()
-    logger.info("Bot started. version=%s AI_JUDGE_MODE=%s MIN_TARGET_CONFIDENCE=%s CATCH_ALL_MODE=%s BROAD_SEARCH_MODE=%s ONLY_RECENT_RAW=%s ONLY_RECENT_EFFECTIVE=%s SKIP_UNKNOWN_AGE=%s", BOT_VERSION, AI_JUDGE_MODE, MIN_TARGET_CONFIDENCE, CATCH_ALL_MODE, BROAD_SEARCH_MODE, ONLY_RECENT_MINUTES_RAW, ONLY_RECENT_MINUTES, SKIP_UNKNOWN_AGE)
+    logger.info("Bot started. version=%s AI_JUDGE_MODE=%s MIN_TARGET_CONFIDENCE=%s CATCH_ALL_MODE=%s BROAD_SEARCH_MODE=%s ONLY_RECENT_RAW=%s ONLY_RECENT_EFFECTIVE=%s SKIP_UNKNOWN_AGE=%s VINTED_BLOCK_COOLDOWN_SECONDS=%s HEALTH_ALERT_COOLDOWN_SECONDS=%s", BOT_VERSION, AI_JUDGE_MODE, MIN_TARGET_CONFIDENCE, CATCH_ALL_MODE, BROAD_SEARCH_MODE, ONLY_RECENT_MINUTES_RAW, ONLY_RECENT_MINUTES, SKIP_UNKNOWN_AGE, VINTED_BLOCK_COOLDOWN_SECONDS, HEALTH_ALERT_COOLDOWN_SECONDS)
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
